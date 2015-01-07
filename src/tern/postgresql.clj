@@ -9,7 +9,7 @@
 (def ^{:doc "Set of supported commands. Used in `generate-sql` dispatch."
        :private true}
   supported-commands
-  #{:create-table :drop-table :alter-table :create-index :drop-index})
+  #{:create-table :drop-table :alter-table :create-index :drop-index :create-view :drop-view})
 
 (defn generate-table-spec
   [{:keys [primary-key] :as command}]
@@ -32,6 +32,16 @@
   [{table :drop-table}]
   (log/info " - Dropping table" (log/highlight (name table)))
   [(jdbc/drop-table-ddl table)])
+
+(defmethod generate-sql
+  :create-view
+  [{view :create-view query :as}]
+  [(format "CREATE VIEW %s AS %s" (to-sql-name view) query)])
+
+(defmethod generate-sql
+  :drop-view
+  [{view :drop-view}]
+  [(format "DROP VIEW %s" (to-sql-name view))])
 
 (defmethod generate-sql
   :alter-table
