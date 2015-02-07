@@ -1,11 +1,10 @@
-(defproject lein-tern "0.1.4-SNAPSHOT"
+(defproject cc.artifice/lein-tern "0.2.0"
   :description "Migrations as data"
-  :url "http://github.com/bugsbio/lein-tern"
+  :url "http://github.com/artifice-cc/lein-tern"
   :license {:name "MIT"
             :url "http://opensource.org/licenses/MIT"}
-  :signing {:gpg-key "CF73E6ED"}
   :scm  {:name "git"
-         :url "https://github.com/bugsbio/lein-tern"}
+         :url "https://github.com/artifice-cc/lein-tern"}
   :dependencies [[org.clojure/clojure "1.6.0"]
                  [clj-time "0.8.0"]
                  [org.clojure/java.jdbc "0.3.2"]
