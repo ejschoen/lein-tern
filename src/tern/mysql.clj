@@ -156,10 +156,12 @@
   (when-not (vector? commands)
     (log/error "Values for `up` and `down` must be vectors of commands"))
   (try
-    (apply jdbc/db-do-commands
-           (db-spec db)
-           (conj (into [] (mapcat generate-sql commands))
-                 (update-schema-version version-table version)))))
+    (let [sql-commands (into [] (mapcat generate-sql commands))]
+      (log/info "Running: " sql-commands)
+      (apply jdbc/db-do-commands
+             (db-spec db)
+             (conj sql-commands
+                   (update-schema-version version-table version))))))
 
 (defn- validate-commands
   [commands]
