@@ -57,7 +57,7 @@
                       (to-sql-name table)
                       (to-sql-name column)
                       (s/join " " specs))))]
-    (concat removals additions modifications)))
+    (doall (concat removals additions modifications))))
 
 (defmethod generate-sql
   :create-index
@@ -65,7 +65,7 @@
     table   :on
     columns :columns
     unique  :unique}]
-  (log/info " - Creating" (when unique "unique") "index" (log/highlight (name index)) "on" (log/highlight (name table)))
+  (log/info " - Creating" (if unique "unique" "") "index" (log/highlight (name index)) "on" (log/highlight (name table)))
   [(format "CREATE %s INDEX %s ON %s (%s)"
            (if unique "UNIQUE" "")
            (to-sql-name index)
