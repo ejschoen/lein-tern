@@ -142,14 +142,10 @@
       :row-fn :version
       :result-set-fn first)))
 
-(defn- current-timestamp
-  []
-  (.getTime (Date.)))
-
 (defn- update-schema-version
   [version-table version]
-  (format "INSERT INTO %s (version, created) VALUES (%s, %s)"
-          version-table version (current-timestamp)))
+  (format "INSERT INTO %s (version) VALUES (%s)"
+          version-table version))
 
 (defn- run-migration!
   [{:keys [db version-table]} version commands]
