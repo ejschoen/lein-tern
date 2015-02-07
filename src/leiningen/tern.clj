@@ -24,7 +24,7 @@
    (log/info "Run" (log/highlight "lein help tern") "for a list of available commands."))
   ([project cmd & args]
    (let [user-config-fn (or (-> project :tern :init) 'tern.user/config)
-         tern-profile   {:dependencies [['lein-tern tern-version]]}]
+         tern-profile   {:dependencies [['cc.artifice/lein-tern tern-version]]}]
      (eval-in-project
        (project/merge-profiles project [tern-profile])
        `(do
