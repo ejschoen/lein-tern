@@ -11,10 +11,21 @@
   supported-commands
   #{:create-table :drop-table :alter-table :create-index :drop-index})
 
-(defn generate-table-spec
+(defn generate-pk
   [{:keys [primary-key] :as command}]
   (when primary-key
     (format "PRIMARY KEY (%s)" (to-sql-list primary-key))))
+
+(defn generate-table-spec
+  [{:keys [constraints] :as command}]
+  (let [fks 
+        (when constraints
+          (for [[constraint & specs] constraints]
+            (do
+              (format "CONSTRAINT %s FOREIGN KEY %s"
+                      (to-sql-name constraint)
+                      (s/join " " specs)))))]
+    (when fks (s/join " " fks))))
 
 (defmulti generate-sql
   (fn [c] (some supported-commands (keys c))))
@@ -23,9 +34,13 @@
   :create-table
   [{table :create-table columns :columns :as command}]
   (log/info " - Creating table" (log/highlight (name table)))
-  (if-let [table-spec (generate-table-spec command)]
-    [(apply jdbc/create-table-ddl table (conj columns [table-spec]))]
-    [(apply jdbc/create-table-ddl table columns)]))
+  (let [table-spec (generate-table-spec command)
+        create-command (if-let [pk (generate-pk command)]
+                         (apply jdbc/create-table-ddl table (conj columns [pk]))
+                         (apply jdbc/create-table-ddl table columns))]
+     [(if table-spec
+        (format "%s %s" create-command table-spec)
+        create-command)]))
 
 (defmethod generate-sql
   :drop-table
@@ -35,7 +50,8 @@
 
 (defmethod generate-sql
   :alter-table
-  [{table :alter-table add-columns :add-columns drop-columns :drop-columns modify-columns :modify-columns}]
+  [{table :alter-table add-columns :add-columns drop-columns :drop-columns modify-columns :modify-columns
+          add-constraints :add-constraints  drop-constraints :drop-constraints}]
   (log/info " - Altering table" (log/highlight (name table)))
   (let [additions
         (for [[column & specs] add-columns]
@@ -56,8 +72,21 @@
               (format "ALTER TABLE %s MODIFY COLUMN %s %s"
                       (to-sql-name table)
                       (to-sql-name column)
-                      (s/join " " specs))))]
-    (doall (concat removals additions modifications))))
+                      (s/join " " specs))))
+        new-constraints
+        (for [[constraint & specs] add-constraints]
+          (do (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
+              (format "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
+                      (to-sql-name table)
+                      (to-sql-name constraint)
+                      (s/join  " " specs))))
+       old-constraints
+       (for [constraint drop-constraints]
+         (do (log/info "    * Removing constraint " (log/highlight constraint))
+             (format "ALTER TABLE %s DROP FOREIGN KEY %s",
+                     (to-sql-name table)
+                     (to-sql-name constraint))))]
+    (doall (concat old-constraints removals additions modifications new-constraints))))
 
 (defmethod generate-sql
   :create-index
@@ -137,8 +166,8 @@
     (jdbc/query
       (db-spec db)
       [(format "SELECT version FROM %s
-               ORDER BY version DESC
-               LIMIT 1" version-table)]
+                  ORDER BY version DESC
+                  LIMIT 1" version-table)]
       :row-fn :version
       :result-set-fn first)))
 
@@ -153,7 +182,7 @@
     (log/error "Values for `up` and `down` must be vectors of commands"))
   (try
     (let [sql-commands (into [] (mapcat generate-sql commands))]
-      (log/info "Running: " sql-commands)
+      (log/info "Running: " (s/join "\n" sql-commands))
       (apply jdbc/db-do-commands
 							             (db-spec db)
 							             (conj sql-commands
