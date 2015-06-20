@@ -137,7 +137,7 @@
     (jdbc/query
       (db-spec db)
       [(format "SELECT version FROM %s
-               ORDER BY created DESC
+               ORDER BY version DESC
                LIMIT 1" version-table)]
       :row-fn :version
       :result-set-fn first)))
@@ -155,9 +155,9 @@
     (let [sql-commands (into [] (mapcat generate-sql commands))]
       (log/info "Running: " sql-commands)
       (apply jdbc/db-do-commands
-             (db-spec db)
-             (conj sql-commands
-                   (update-schema-version version-table version))))))
+							             (db-spec db)
+							             (conj sql-commands
+							                   (update-schema-version version-table version))))))
 
 (defn- validate-commands
   [commands]
