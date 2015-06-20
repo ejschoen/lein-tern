@@ -16,7 +16,7 @@
   (when primary-key
     (format "PRIMARY KEY (%s)" (to-sql-list primary-key))))
 
-(defn generate-table-spec
+(defn generate-constraints
   [{:keys [constraints] :as command}]
   (let [fks 
         (when constraints
@@ -25,7 +25,7 @@
               (format "CONSTRAINT %s FOREIGN KEY %s"
                       (to-sql-name constraint)
                       (s/join " " specs)))))]
-    (when fks (s/join " " fks))))
+    (when fks (map (fn [fk] [fk]) fks))))
 
 (defmulti generate-sql
   (fn [c] (some supported-commands (keys c))))
@@ -34,13 +34,13 @@
   :create-table
   [{table :create-table columns :columns :as command}]
   (log/info " - Creating table" (log/highlight (name table)))
-  (let [table-spec (generate-table-spec command)
-        create-command (if-let [pk (generate-pk command)]
-                         (apply jdbc/create-table-ddl table (conj columns [pk]))
-                         (apply jdbc/create-table-ddl table columns))]
-     [(if table-spec
-        (format "%s %s" create-command table-spec)
-        create-command)]))
+  (let [constraints (generate-constraints command)
+        pk (generate-pk command)]
+     [(if pk
+          (apply jdbc/create-table-ddl table (apply conj columns [pk] constraints))
+          (if constraints
+              (apply jdbc/create-table-ddl table (apply conj columns constraints))
+              (apply jdbc/create-table-ddl table columns)))]))
 
 (defmethod generate-sql
   :drop-table
