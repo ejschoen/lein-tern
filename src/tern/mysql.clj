@@ -183,7 +183,7 @@
   (try
     (let [sql-commands (into [] (mapcat generate-sql commands))]
       (doseq [cmd sql-commands]
-        (log/info "Running: " cmd)
+        (log/info "Executing: " cmd)
         (jdbc/db-do-commands (db-spec db) cmd))
       (log/info "Updating version to: " version)
       (jdbc/db-do-commands (db-spec db) (update-schema-version version-table version)))))
