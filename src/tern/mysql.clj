@@ -182,11 +182,11 @@
     (log/error "Values for `up` and `down` must be vectors of commands"))
   (try
     (let [sql-commands (into [] (mapcat generate-sql commands))]
-      (log/info "Running: " (s/join "\n" sql-commands))
-      (apply jdbc/db-do-commands
-							             (db-spec db)
-							             (conj sql-commands
-							                   (update-schema-version version-table version))))))
+      (doseq [cmd sql-commands]
+        (log/info "Running: " cmd)
+        (jdbc/db-do-commands (db-spec db) cmd))
+      (log/info "Updating version to: " version)
+      (jdbc/db-do-commands (db-spec db) (update-schema-version version-table version)))))
 
 (defn- validate-commands
   [commands]
