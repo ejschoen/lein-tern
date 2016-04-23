@@ -9,7 +9,7 @@
 (def ^{:doc "Set of supported commands. Used in `generate-sql` dispatch."
        :private true}
   supported-commands
-  #{:create-table :drop-table :alter-table :create-index :drop-index})
+  #{:create-table :drop-table :alter-table :create-index :drop-index :insert-into})
 
 (defn generate-pk
   [{:keys [primary-key] :as command}]
@@ -106,6 +106,13 @@
   [{index :drop-index table :on}]
   (log/info " - Dropping index" (log/highlight (name index)))
   [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])
+
+(defmethod generate-sql
+  :insert-into
+  [{table :insert-into values :values}]
+  (log/info " - Inserting into" (log/highlight (name table)))
+  [(format "INSERT INTO %s VALUES %s" (to-sql-name table)
+           (s/join "," (map (fn [vals] (format "(%s)" (s/join "," (map pr-str vals)))) values)))])
 
 (defmethod generate-sql
   :default

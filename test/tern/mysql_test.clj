@@ -14,4 +14,7 @@
 (expect ["CREATE TABLE foo (a INT, PRIMARY KEY (a), CONSTRAINT fk_a FOREIGN KEY (a) REFERENCES foo(a))"]
         (generate-sql {:create-table :foo :columns [[:a "INT"]] :primary-key [:a] :constraints [[:fk_a "(a) REFERENCES foo(a)"]]}))
 
+(expect ["INSERT INTO foo VALUES (1,2,\"foo\"),(3,4,\"bar\")"]
+        (generate-sql {:insert-into :foo :values [[1 2 "foo"] [3 4 "bar"]]}))
+
 
