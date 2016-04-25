@@ -75,17 +75,28 @@
                       (s/join " " specs))))
         new-constraints
         (for [[constraint & specs] add-constraints]
-          (do (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
-              (format "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
-                      (to-sql-name table)
-                      (to-sql-name constraint)
-                      (s/join  " " specs))))
+          (let [test (format (str "IF NOT EXISTS (SELECT 1 FROM information_schema.TABLE_CONSTRAINTS WHERE "
+                                  "CONSTRAINT_SCHEMA=DATABASE() AND "
+                                  "CONSTRAINT_NAME='%s' AND "
+                                  "CONSTRAINT_TYPE='FOREIGN KEY') THEN")
+                             (to-sql-name constraint))]
+            (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
+            (format "%s ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
+                    test (to-sql-name table)
+                    (to-sql-name constraint)
+                    (s/join  " " specs))))
        old-constraints
        (for [constraint drop-constraints]
-         (do (log/info "    * Removing constraint " (log/highlight constraint))
-             (format "ALTER TABLE %s DROP FOREIGN KEY %s",
-                     (to-sql-name table)
-                     (to-sql-name constraint))))]
+         (let [test (format (str "IF EXISTS (SELECT 1 FROM information_schema.TABLE_CONSTRAINTS WHERE "
+                                  "CONSTRAINT_SCHEMA=DATABASE() AND "
+                                  "CONSTRAINT_NAME='%s' AND "
+                                  "CONSTRAINT_TYPE='FOREIGN KEY') THEN")
+                             (to-sql-name constraint))]
+           (log/info "    * Removing constraint " (log/highlight constraint))
+           (format "%s ALTER TABLE %s DROP FOREIGN KEY %s",
+                   test
+                   (to-sql-name table)
+                   (to-sql-name constraint))))]
     (doall (concat old-constraints removals additions modifications new-constraints))))
 
 (defmethod generate-sql
