@@ -17,4 +17,10 @@
 (expect ["INSERT INTO foo VALUES (1,2,\"foo\"),(3,4,\"bar\")"]
         (generate-sql {:insert-into :foo :values [[1 2 "foo"] [3 4 "bar"]]}))
 
+(expect ["ALTER TABLE foo ADD CONSTRAINT fk_foo_bar FOREIGN KEY (bar_id) REFERENCES bar(id)"]
+        (generate-sql {:alter-table :foo :add-constraints [[:fk_foo_bar "(bar_id) REFERENCES bar(id)"]]}))
+
+
+
+
 

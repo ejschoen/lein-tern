@@ -6,6 +6,10 @@
   (:import [java.util Date]
            [java.sql PreparedStatement Timestamp]))
 
+(declare foreign-key-exists?)
+
+(def ^:dynamic *db* nil)
+
 (def ^{:doc "Set of supported commands. Used in `generate-sql` dispatch."
        :private true}
   supported-commands
@@ -75,18 +79,25 @@
                       (s/join " " specs))))
         new-constraints
         (for [[constraint & specs] add-constraints]
-          (do (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
+          (if (not (foreign-key-exists? *db* (to-sql-name constraint)))
+            (do
+              (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
               (format "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
                       (to-sql-name table)
                       (to-sql-name constraint)
-                      (s/join  " " specs))))
+                      (s/join  " " specs)))
+            (log/info "    * Skipping adding constraint " (log/highlight (if constraint constraint "unnamed"))
+                      " because it already exists")))
        old-constraints
        (for [constraint drop-constraints]
-         (do (log/info "    * Removing constraint " (log/highlight constraint))
+         (if (foreign-key-exists? *db* (to-sql-name constraint))
+           (do
+             (log/info "    * Removing constraint " (log/highlight constraint))
              (format "ALTER TABLE %s DROP FOREIGN KEY %s",
                      (to-sql-name table)
-                     (to-sql-name constraint))))]
-    (doall (concat old-constraints removals additions modifications new-constraints))))
+                     (to-sql-name constraint)))
+           (log/info "   * Skipping removing constraint " (log/highlight constraint) " because it does not exist")))]
+    (doall (filter identity (concat old-constraints removals additions modifications new-constraints)))))
 
 (defmethod generate-sql
   :create-index
@@ -126,6 +137,16 @@
     (db-spec db "mysql")
     ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (:database db)]
     :result-set-fn first))
+
+(defn- foreign-key-exists?
+  [db fk]
+  (if db
+    (jdbc/query
+     (db-spec db)
+     ["SELECT 1 from information_schema.table_constraints WHERE CONSTRAINT_SCHEMA=DATABASE() AND CONSTRAINT_NAME=? AND CONSTRAINT_TYPE='FOREIGN KEY'" fk]
+     :result-set-fn first)
+    false))
+
 
 (defn- table-exists?
   [db table]
@@ -188,12 +209,13 @@
   (when-not (vector? commands)
     (log/error "Values for `up` and `down` must be vectors of commands"))
   (try
-    (let [sql-commands (into [] (mapcat generate-sql commands))]
-      (doseq [cmd sql-commands]
-        (log/info "Executing: " cmd)
-        (jdbc/db-do-commands (db-spec db) cmd))
-      (log/info "Updating version to: " version)
-      (jdbc/db-do-commands (db-spec db) (update-schema-version version-table version)))))
+    (binding [*db* db]
+      (let [sql-commands (into [] (mapcat generate-sql commands))]
+        (doseq [cmd sql-commands]
+          (log/info "Executing: " cmd)
+          (jdbc/db-do-commands (db-spec db) cmd))
+        (log/info "Updating version to: " version)
+        (jdbc/db-do-commands (db-spec db) (update-schema-version version-table version))))))
 
 (defn- validate-commands
   [commands]
