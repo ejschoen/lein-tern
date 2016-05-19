@@ -194,7 +194,7 @@
     (jdbc/query
       (db-spec db)
       [(format "SELECT version FROM %s
-                  ORDER BY version DESC
+                  ORDER BY created DESC
                   LIMIT 1" version-table)]
       :row-fn :version
       :result-set-fn first)))
