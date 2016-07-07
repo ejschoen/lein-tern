@@ -6,7 +6,7 @@
   (:import [java.util Date]
            [java.sql PreparedStatement Timestamp]))
 
-(declare foreign-key-exists?)
+(declare foreign-key-exists? index-exists? column-exists?)
 
 (def ^:dynamic *db* nil)
 
@@ -59,17 +59,25 @@
   (log/info " - Altering table" (log/highlight (name table)))
   (let [additions
         (for [[column & specs] add-columns]
-          (do (log/info "    * Adding column" (log/highlight (name column)))
-            (format "ALTER TABLE %s ADD COLUMN %s %s"
-                    (to-sql-name table)
-                    (to-sql-name column)
-                    (s/join " " specs))))
+          (if (column-exists? *db* (to-sql-name table) (to-sql-name column))
+            (do (log/info (format "   * Skipping ADD COLUMN %s.%s because it already exists."
+                                  (to-sql-name table) (to-sql-name column)))
+                nil)
+            (do (log/info "    * Adding column" (log/highlight (name column)))
+                (format "ALTER TABLE %s ADD COLUMN %s %s"
+                        (to-sql-name table)
+                        (to-sql-name column)
+                        (s/join " " specs)))))
         removals
         (for [column drop-columns]
-          (do (log/info "    * Dropping column" (log/highlight (name column)))
-            (format "ALTER TABLE %s DROP COLUMN %s"
-                    (to-sql-name table)
-                    (to-sql-name column))))
+          (if (column-exists? *db* (to-sql-name table) (to-sql-name column))
+            (do (log/info "    * Dropping column" (log/highlight (name column)))
+                (format "ALTER TABLE %s DROP COLUMN %s"
+                        (to-sql-name table)
+                        (to-sql-name column)))
+            (do (log/info "   * Skipping DROP COLUMN %s.%s because that column does not exist."
+                          (to-sql-name table) (to-sql-name column))
+                nil)))
         modifications
         (for [[column & specs] modify-columns]
           (do (log/info "    * Modifying column" (log/highlight (name column)))
@@ -105,18 +113,26 @@
     table   :on
     columns :columns
     unique  :unique}]
-  (log/info " - Creating" (if unique "unique" "") "index" (log/highlight (name index)) "on" (log/highlight (name table)))
-  [(format "CREATE %s INDEX %s ON %s (%s)"
-           (if unique "UNIQUE" "")
-           (to-sql-name index)
-           (to-sql-name table)
-           (s/join ", " (map to-sql-name columns)))])
+  (if (index-exists? *db* (to-sql-name table) (to-sql-name index))
+    (do (log/info (format "   * Skipping CREATE INDEX on table %s name %s because it already exists."
+                          (to-sql-name table) (to-sql-name index)))
+        nil)
+    (do (log/info " - Creating" (if unique "unique" "") "index" (log/highlight (name index)) "on" (log/highlight (name table)))
+        [(format "CREATE %s INDEX %s ON %s (%s)"
+                 (if unique "UNIQUE" "")
+                 (to-sql-name index)
+                 (to-sql-name table)
+                 (s/join ", " (map to-sql-name columns)))])))
 
 (defmethod generate-sql
   :drop-index
   [{index :drop-index table :on}]
-  (log/info " - Dropping index" (log/highlight (name index)))
-  [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])
+  (if (index-exists? *db* (to-sql-name table) (to-sql-name index))
+    (do (log/info " - Dropping index" (log/highlight (name index)))
+        [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])
+    (do (log/info (format "   * Skipping DROP INDEX on table %s index %s because that index does not exist."
+                          table index))
+        nil)))
 
 (defmethod generate-sql
   :insert-into
@@ -147,6 +163,16 @@
      :result-set-fn first)
     false))
 
+(defn- index-exists?
+  [db table index]
+  (if db
+    (do 
+      ;;(log/info (format "   * Testing whether table %s has index %s" table index))
+      (jdbc/query
+       (db-spec db)
+       ["SELECT 1 from information_schema.statistics WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?" table index]
+       :result-set-fn first))
+    false))
 
 (defn- table-exists?
   [db table]
@@ -154,6 +180,13 @@
     (db-spec db)
     ["SELECT 1 FROM information_schema.tables WHERE table_name = ?" table]
     :result-set-fn first))
+
+(defn- column-exists?
+  [db table column]
+  (jdbc/query
+   (db-spec db)
+   ["SELECT 1 from information_schema.columns where table_name=? and column_name=?" table column]
+   :result-set-fn first))
 
 (defn- create-database
   [db]
