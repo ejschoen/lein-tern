@@ -55,7 +55,8 @@
 (defmethod generate-sql
   :alter-table
   [{table :alter-table add-columns :add-columns drop-columns :drop-columns modify-columns :modify-columns
-          add-constraints :add-constraints  drop-constraints :drop-constraints}]
+    add-constraints :add-constraints  drop-constraints :drop-constraints
+    character-set :character-set}]
   (log/info " - Altering table" (log/highlight (name table)))
   (let [additions
         (for [[column & specs] add-columns]
@@ -104,8 +105,15 @@
              (format "ALTER TABLE %s DROP FOREIGN KEY %s",
                      (to-sql-name table)
                      (to-sql-name constraint)))
-           (log/info "   * Skipping removing constraint " (log/highlight constraint) " because it does not exist")))]
-    (doall (filter identity (concat old-constraints removals additions modifications new-constraints)))))
+           (log/info "   * Skipping removing constraint " (log/highlight constraint) " because it does not exist")))
+        charset
+        (when character-set
+          [(str
+            (format "ALTER TABLE %s CONVERT TO CHARACTER SET %s" (to-sql-name table) (:charset-name character-set))
+            (if (:collation character-set)
+              (format " COLLATE %s" (:collation character-set))
+              ""))])]
+    (doall (filter identity (concat charset old-constraints removals additions modifications new-constraints)))))
 
 (defmethod generate-sql
   :create-index
