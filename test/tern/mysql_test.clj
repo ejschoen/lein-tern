@@ -20,7 +20,20 @@
 (expect ["ALTER TABLE foo ADD CONSTRAINT fk_foo_bar FOREIGN KEY (bar_id) REFERENCES bar(id)"]
         (generate-sql {:alter-table :foo :add-constraints [[:fk_foo_bar "(bar_id) REFERENCES bar(id)"]]}))
 
+(expect ["ALTER TABLE foo ROW_FORMAT=Compressed"
+         "ALTER TABLE foo ADD CONSTRAINT fk_foo_bar FOREIGN KEY (bar_id) REFERENCES bar(id)"]
+        (generate-sql {:alter-table :foo
+                       :table-options [{:name "ROW_FORMAT" :value "Compressed"}]
+                       :add-constraints [[:fk_foo_bar "(bar_id) REFERENCES bar(id)"]]}))
 
-
-
+(expect ["CREATE TABLE foo (__placeholder int)"
+         "ALTER TABLE foo ROW_FORMAT=Compressed"
+         "ALTER TABLE foo ADD COLUMN a INT"
+         "ALTER TABLE foo ADD COLUMN b INT"
+         "ALTER TABLE foo ADD PRIMARY KEY (a)"
+         "ALTER TABLE foo DROP COLUMN __placeholder"]
+        (generate-sql {:create-table :foo
+                       :primary-key [:a]
+                       :table-options [{:name "ROW_FORMAT" :value "Compressed"}]
+                       :columns [[:a "INT"] [:b "INT"]]}))
 

@@ -31,20 +31,41 @@
                       (s/join " " specs)))))]
     (when fks (map (fn [fk] [fk]) fks))))
 
+
+(defn generate-options
+  [table-options]
+  (when (not-empty table-options)
+    (s/join ", "
+            (for [option table-options]
+              (format "%s=%s" (:name option) (:value option))))))
+
 (defmulti generate-sql
   (fn [c] (some supported-commands (keys c))))
 
 (defmethod generate-sql
   :create-table
-  [{table :create-table columns :columns :as command}]
+  [{table :create-table columns :columns table-options :table-options :as command}]
   (log/info " - Creating table" (log/highlight (name table)))
   (let [constraints (generate-constraints command)
+        table-spec (generate-options table-options)
         pk (generate-pk command)]
-     [(if pk
-          (apply jdbc/create-table-ddl table (apply conj columns [pk] constraints))
-          (if constraints
-              (apply jdbc/create-table-ddl table (apply conj columns constraints))
-              (apply jdbc/create-table-ddl table columns)))]))
+    (if (not-empty table-spec)
+      (concat
+       (apply conj
+              (generate-sql {:create-table table :columns [[:__placeholder "int"]]})
+              (generate-sql {:alter-table table
+                             :table-options table-options
+                             :add-columns columns
+                             :add-constraints (:constraints command)}))
+       (apply conj
+              [(format "ALTER TABLE %s ADD %s" (to-sql-name table) pk)]
+              (generate-sql {:alter-table table
+                             :drop-columns [:__placeholder]})))
+      [(if pk
+         (apply jdbc/create-table-ddl table (apply conj columns [pk] constraints))
+         (if constraints
+           (apply jdbc/create-table-ddl table (apply conj columns constraints))
+           (apply jdbc/create-table-ddl table columns)))])))
 
 (defmethod generate-sql
   :drop-table
@@ -56,11 +77,11 @@
   :alter-table
   [{table :alter-table add-columns :add-columns drop-columns :drop-columns modify-columns :modify-columns
     add-constraints :add-constraints  drop-constraints :drop-constraints
-    character-set :character-set}]
+    table-options :table-options character-set :character-set}]
   (log/info " - Altering table" (log/highlight (name table)))
   (let [additions
         (for [[column & specs] add-columns]
-          (if (column-exists? *db* (to-sql-name table) (to-sql-name column))
+          (if (and *db* (column-exists? *db* (to-sql-name table) (to-sql-name column)))
             (do (log/info (format "   * Skipping ADD COLUMN %s.%s because it already exists."
                                   (to-sql-name table) (to-sql-name column)))
                 nil)
@@ -71,7 +92,7 @@
                         (s/join " " specs)))))
         removals
         (for [column drop-columns]
-          (if (column-exists? *db* (to-sql-name table) (to-sql-name column))
+          (if (or (not *db*) (column-exists? *db* (to-sql-name table) (to-sql-name column)))
             (do (log/info "    * Dropping column" (log/highlight (name column)))
                 (format "ALTER TABLE %s DROP COLUMN %s"
                         (to-sql-name table)
@@ -88,7 +109,7 @@
                       (s/join " " specs))))
         new-constraints
         (for [[constraint & specs] add-constraints]
-          (if (not (foreign-key-exists? *db* (to-sql-name constraint)))
+          (if (or (not *db*) (not (foreign-key-exists? *db* (to-sql-name constraint))))
             (do
               (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
               (format "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
@@ -99,13 +120,17 @@
                       " because it already exists")))
        old-constraints
        (for [constraint drop-constraints]
-         (if (foreign-key-exists? *db* (to-sql-name constraint))
+         (if (or (not *db*) (foreign-key-exists? *db* (to-sql-name constraint)))
            (do
              (log/info "    * Removing constraint " (log/highlight constraint))
              (format "ALTER TABLE %s DROP FOREIGN KEY %s",
                      (to-sql-name table)
                      (to-sql-name constraint)))
            (log/info "   * Skipping removing constraint " (log/highlight constraint) " because it does not exist")))
+        options
+        (when (not-empty table-options)
+          [(str (format "ALTER TABLE %s " (to-sql-name table))
+                (generate-options table-options))])
         charset
         (when character-set
           [(str
@@ -113,7 +138,7 @@
             (if (:collation character-set)
               (format " COLLATE %s" (:collation character-set))
               ""))])]
-    (doall (filter identity (concat charset old-constraints removals additions modifications new-constraints)))))
+    (doall (filter identity (concat options charset old-constraints removals additions modifications new-constraints)))))
 
 (defmethod generate-sql
   :create-index
@@ -121,7 +146,7 @@
     table   :on
     columns :columns
     unique  :unique}]
-  (if (index-exists? *db* (to-sql-name table) (to-sql-name index))
+  (if (and *db* (index-exists? *db* (to-sql-name table) (to-sql-name index)))
     (do (log/info (format "   * Skipping CREATE INDEX on table %s name %s because it already exists."
                           (to-sql-name table) (to-sql-name index)))
         nil)
@@ -135,7 +160,7 @@
 (defmethod generate-sql
   :drop-index
   [{index :drop-index table :on}]
-  (if (index-exists? *db* (to-sql-name table) (to-sql-name index))
+  (if (or (not *db*) (index-exists? *db* (to-sql-name table) (to-sql-name index)))
     (do (log/info " - Dropping index" (log/highlight (name index)))
         [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])
     (do (log/info (format "   * Skipping DROP INDEX on table %s index %s because that index does not exist."
