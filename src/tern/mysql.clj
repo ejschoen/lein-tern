@@ -169,10 +169,14 @@
 
 (defmethod generate-sql
   :insert-into
-  [{table :insert-into values :values}]
+  [{table :insert-into values :values query :query}]
   (log/info " - Inserting into" (log/highlight (name table)))
-  [(format "INSERT INTO %s VALUES %s" (to-sql-name table)
-           (s/join "," (map (fn [vals] (format "(%s)" (s/join "," (map pr-str vals)))) values)))])
+  (cond (not-empty values)
+        [(format "INSERT INTO %s VALUES %s" (to-sql-name table)
+                 (s/join "," (map (fn [vals] (format "(%s)" (s/join "," (map pr-str vals)))) values)))]
+        (not-empty query)
+        [(format "INSERT INTO %s %s" (to-sql-name table) query)]
+        :else (throw (Exception. ":insert-into must contain a non-empty :values or :query key"))))
 
 (defmethod generate-sql
   :default
