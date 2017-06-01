@@ -39,7 +39,7 @@ NB. There are example postgresql and mysql projects in the `examples` directory.
 
 ### Installation & Configuration
 
-Add `[lein-tern "0.1.3"]` to the `:plugins` vector of your project.clj, and add a `:tern` key with the following (optional) configuration, shown with default values:
+Add `[cc-artifice/lein-tern "0.5.1"]` to the `:plugins` vector of your project.clj, and add a `:tern` key with the following (optional) configuration, shown with default values:
 
 ```clojure
 (defproject postgres-project "0.1.0"
@@ -47,7 +47,7 @@ Add `[lein-tern "0.1.3"]` to the `:plugins` vector of your project.clj, and add 
   :url "http://github.com/bugsbio/lein-tern"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
-  :plugins [[lein-tern "0.1.4-SNAPSHOT"]]
+  :plugins [[cc-artifice/lein-tern "0.5.1"]]
   :dependencies [[org.clojure/clojure "1.6.0"]
                  [postgresql "9.3-1102.jdbc41"]]
 
