@@ -119,6 +119,8 @@ Currently Tern supports creating and dropping tables, columns, and indexes, for 
 {:create-table :cat-ownerns
  :columns [[:cat_id    "BIGINT" "NOT NULL"]
            [:person_id "BIGINT" "NOT NULL"]]
+ ;; MySQL only
+ :table-options [{:name :row_format :value "Compressed"}]	   
  :primary-key [:cat_id :person_id]}
 
 ;; Dropping a table
@@ -128,13 +130,31 @@ Currently Tern supports creating and dropping tables, columns, and indexes, for 
 {:alter-table :cats :add-columns [[:favourite-food "TEXT" "DEFAULT 'fish'"]]}
 
 ;; Dropping columns
-{:alter-table :cats :drop-columns [:favourite-food :favourite-toy]}
+{:alter-table :cats
+ :drop-columns [:favourite-food]
+ :add-columns [[:color "TEXT" "NOT NULL"]]
+ :modify-columns [[:favourite-toy "TEXT" "NULL"]]
+ :add-constraints [{:fk_person_id_person "(person_id) REFERENCES person(id) ON DELETE NO ACTION"}]
+ :drop-constraints [:fk_cat_id_cat]
+ ;; MySQL only
+ :character-set {:charset-name "utf8" :collation "utf8_general_ci"}
+ :table-options [{:name :row_format :value "Compressed"}]}
 
 ;; Creating indexes
 {:create-index :cat-name :on :cats :unique true :columns [:name]}
 
-;; Dropping indexs
+;; Dropping indexes
 {:drop-index :cat-name :on :cats}
+
+;; Inserting seed values (constants, or by querying another table)
+{:insert-into :cats
+ :values [[1 "Fluffy" 4]
+          [2 "Kitt Peak" 4]]}
+{:insert-into :cats
+ :query "select * from temporary_cats"}
+
+;; Updating data in place
+{:update "update cats set paws=4"}
 ```
 
 You can have as many commands as you like in the `:up` and `:down` vectors; they will be executed in order.
