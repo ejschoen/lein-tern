@@ -136,9 +136,9 @@ Currently Tern supports creating and dropping tables, columns, and indexes, for 
  :modify-columns [[:favourite-toy "TEXT" "NULL"]]
  :add-constraints [{:fk_person_id_person "(person_id) REFERENCES person(id) ON DELETE NO ACTION"}]
  :drop-constraints [:fk_cat_id_cat]
+ :table-options [{:name :row_format :value "Compressed"}]
  ;; MySQL only
- :character-set {:charset-name "utf8" :collation "utf8_general_ci"}
- :table-options [{:name :row_format :value "Compressed"}]}
+ :character-set {:charset-name "utf8" :collation "utf8_general_ci"}}}
 
 ;; Creating indexes
 {:create-index :cat-name :on :cats :unique true :columns [:name]}
@@ -146,14 +146,14 @@ Currently Tern supports creating and dropping tables, columns, and indexes, for 
 ;; Dropping indexes
 {:drop-index :cat-name :on :cats}
 
-;; Inserting seed values (constants, or by querying another table)
+;; Inserting seed values (constants, or by querying another table)  -- MySQL only
 {:insert-into :cats
  :values [[1 "Fluffy" 4]
           [2 "Kitt Peak" 4]]}
 {:insert-into :cats
  :query "select * from temporary_cats"}
 
-;; Updating data in place
+;; Updating data in place -- MySQL only
 {:update "update cats set paws=4"}
 ```
 
