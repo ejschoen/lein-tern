@@ -13,7 +13,7 @@
 (def ^{:doc "Set of supported commands. Used in `generate-sql` dispatch."
        :private true}
   supported-commands
-  #{:create-table :drop-table :alter-table :create-index :drop-index :insert-into})
+  #{:create-table :drop-table :alter-table :create-index :drop-index :insert-into :update})
 
 (defn generate-pk
   [{:keys [primary-key] :as command}]
@@ -177,6 +177,14 @@
         (not-empty query)
         [(format "INSERT INTO %s %s" (to-sql-name table) query)]
         :else (throw (Exception. ":insert-into must contain a non-empty :values or :query key"))))
+
+(defmethod generate-sql
+  :update
+  [{update-query :update}]
+  (log/info " - Updating the database" (log/highlight update-query))
+  (cond (not-empty update-query)
+        [update-query]
+        :else (throw (Exception. ":update must contain a non-empty update query"))))
 
 (defmethod generate-sql
   :default
