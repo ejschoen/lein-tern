@@ -6,7 +6,7 @@
   (:import [java.util Date]
            [java.sql PreparedStatement Timestamp]))
 
-(declare foreign-key-exists? index-exists? column-exists?)
+(declare foreign-key-exists? index-exists? column-exists? table-exists?)
 
 (def ^:dynamic *db* nil)
 
@@ -49,23 +49,26 @@
   (let [constraints (generate-constraints command)
         table-spec (generate-options table-options)
         pk (generate-pk command)]
-    (if (not-empty table-spec)
-      (concat
-       (apply conj
-              (generate-sql {:create-table table :columns [[:__placeholder "int"]]})
-              (generate-sql {:alter-table table
-                             :table-options table-options
-                             :add-columns columns
-                             :add-constraints (:constraints command)}))
-       (apply conj
-              [(format "ALTER TABLE %s ADD %s" (to-sql-name table) pk)]
-              (generate-sql {:alter-table table
-                             :drop-columns [:__placeholder]})))
-      [(if pk
-         (apply jdbc/create-table-ddl table (apply conj columns [pk] constraints))
-         (if constraints
-           (apply jdbc/create-table-ddl table (apply conj columns constraints))
-           (apply jdbc/create-table-ddl table columns)))])))
+    (if (and *db* (table-exists? *db* (to-sql-name table)))
+      (do (log/info (format "  * Skipping CREATE TABLE %s because it already exists." (to-sql-name table)))
+          nil)
+      (if (not-empty table-spec)
+        (concat
+         (apply conj
+                (generate-sql {:create-table table :columns [[:__placeholder "int"]]})
+                (generate-sql {:alter-table table
+                               :table-options table-options
+                               :add-columns columns
+                               :add-constraints (:constraints command)}))
+         (apply conj
+                [(format "ALTER TABLE %s ADD %s" (to-sql-name table) pk)]
+                (generate-sql {:alter-table table
+                               :drop-columns [:__placeholder]})))
+        [(if pk
+           (apply jdbc/create-table-ddl table (apply conj columns [pk] constraints))
+           (if constraints
+             (apply jdbc/create-table-ddl table (apply conj columns constraints))
+             (apply jdbc/create-table-ddl table columns)))]))))
 
 (defmethod generate-sql
   :drop-table
