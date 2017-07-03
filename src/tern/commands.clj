@@ -4,7 +4,8 @@
             [tern.file            :as f :refer [fname]]
             [tern.implementations :as impl]
             [tern.log             :as log]
-            [tern.migrate         :as migrate]))
+            [tern.migrate         :as migrate]
+            [tern.version         :as tern-version]))
 
 (defn init
   "Creates the table used by `tern` to track versions."
@@ -46,6 +47,12 @@
         from    (db/version impl)
         to      (migrate/version config)
         pending (migrate/pending config from)]
+
+    (log/info "#######################################################")
+    (log/info (format "This is tern version %s" tern-version/tern-version))
+    (log/info "#######################################################")
+    (log/info "")
+    
     (log/info "#######################################################")
     (log/info "Migrating from version" (log/highlight from) "to" (log/highlight to))
     (log/info "#######################################################")
