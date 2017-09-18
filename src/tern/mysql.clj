@@ -9,6 +9,7 @@
 (declare foreign-key-exists? index-exists? column-exists? table-exists?)
 
 (def ^:dynamic *db* nil)
+(def ^:dynamic *plan* nil)
 
 (def ^{:doc "Set of supported commands. Used in `generate-sql` dispatch."
        :private true}
@@ -49,7 +50,9 @@
   (let [constraints (generate-constraints command)
         table-spec (generate-options table-options)
         pk (generate-pk command)]
-    (if (and *db* (table-exists? *db* (to-sql-name table)))
+    (if (and *db*
+             (table-exists? *db* (to-sql-name table))
+             (not (some (fn [prior] (= prior {:drop-table table})) @*plan*)))
       (do (log/info (format "  * Skipping CREATE TABLE %s because it already exists." (to-sql-name table)))
           nil)
       (if (not-empty table-spec)
@@ -84,7 +87,12 @@
   (log/info " - Altering table" (log/highlight (name table)))
   (let [additions
         (for [[column & specs] add-columns]
-          (if (and *db* (column-exists? *db* (to-sql-name table) (to-sql-name column)))
+          (if (and *db*
+                   (column-exists? *db* (to-sql-name table) (to-sql-name column))
+                   (not (some (fn [prior]
+                                (and (= table (:alter-table prior))
+                                     (some (fn [col] (= col column)) (:drop-columns prior))))
+                              *plan*)))
             (do (log/info (format "   * Skipping ADD COLUMN %s.%s because it already exists."
                                   (to-sql-name table) (to-sql-name column)))
                 nil)
@@ -95,7 +103,11 @@
                         (s/join " " specs)))))
         removals
         (for [column drop-columns]
-          (if (or (not *db*) (column-exists? *db* (to-sql-name table) (to-sql-name column)))
+          ;; Note: No test for prior alter table/add column or create table w/ column
+          ;; because frankly it would not make sense in a single migration to create
+          ;; a table column and then immediately drop it.
+          (if (or (not *db*)
+                  (column-exists? *db* (to-sql-name table) (to-sql-name column)))
             (do (log/info "    * Dropping column" (log/highlight (name column)))
                 (format "ALTER TABLE %s DROP COLUMN %s"
                         (to-sql-name table)
@@ -112,7 +124,14 @@
                       (s/join " " specs))))
         new-constraints
         (for [[constraint & specs] add-constraints]
-          (if (or (not *db*) (not (foreign-key-exists? *db* (to-sql-name constraint))))
+          (if (or (not *db*)
+                  (not (foreign-key-exists? *db* (to-sql-name constraint)))
+                  (some (fn [prior]
+                          ;; Did we previously drop the constraint?
+                          (and (= table (:alter-table prior))
+                               (some (fn [[cons & specs]] (= cons constraint))
+                                     (:drop-constraints prior))))
+                        *plan*))
             (do
               (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
               (format "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
@@ -123,7 +142,10 @@
                       " because it already exists")))
        old-constraints
        (for [constraint drop-constraints]
-         (if (or (not *db*) (foreign-key-exists? *db* (to-sql-name constraint)))
+         ;; As with drop-column, we are not checking here for add constraint followed by drop constraint
+         ;; in the same migration.  Wouldn't make sense.
+         (if (or (not *db*)
+                 (foreign-key-exists? *db* (to-sql-name constraint)))
            (do
              (log/info "    * Removing constraint " (log/highlight constraint))
              (format "ALTER TABLE %s DROP FOREIGN KEY %s",
@@ -149,7 +171,12 @@
     table   :on
     columns :columns
     unique  :unique}]
-  (if (and *db* (index-exists? *db* (to-sql-name table) (to-sql-name index)))
+  (if (and *db*
+           (index-exists? *db* (to-sql-name table) (to-sql-name index))
+           (not (some (fn [prior]
+                        (and (= index (:drop-index prior))
+                             (= table (:on prior)))))
+                      *plan*))
     (do (log/info (format "   * Skipping CREATE INDEX on table %s name %s because it already exists."
                           (to-sql-name table) (to-sql-name index)))
         nil)
@@ -163,6 +190,8 @@
 (defmethod generate-sql
   :drop-index
   [{index :drop-index table :on}]
+  ;; As with drop-column, we are not checking here for create index followed by drop index
+  ;; in the same migration.  Wouldn't make sense.
   (if (or (not *db*) (index-exists? *db* (to-sql-name table) (to-sql-name index)))
     (do (log/info " - Dropping index" (log/highlight (name index)))
         [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])
@@ -226,7 +255,7 @@
   [db table]
   (jdbc/query
     (db-spec db)
-    ["SELECT 1 FROM information_schema.tables WHERE table_name = ?" table]
+    ["SELECT 1 FROM information_schema.tables WHERE table_schema=database() and table_name = ?" table]
     :result-set-fn first))
 
 (defn- column-exists?
@@ -290,13 +319,19 @@
   (when-not (vector? commands)
     (log/error "Values for `up` and `down` must be vectors of commands"))
   (try
-    (binding [*db* db]
-      (let [sql-commands (into [] (mapcat generate-sql commands))]
-        (doseq [cmd sql-commands]
-          (log/info "Executing: " cmd)
-          (jdbc/db-do-commands (db-spec db) cmd))
-        (log/info "Updating version to: " version)
-        (jdbc/db-do-commands (db-spec db) (update-schema-version version-table version))))))
+    (binding [*db* db
+              *plan* (atom [])]
+    (let [sql-commands (into [] (mapcat
+                                 (fn [command]
+                                   (let [sql (generate-sql command)]
+                                     (swap! *plan* concat [command])
+                                     sql))
+                                 commands))]
+      (doseq [cmd sql-commands]
+        (log/info "Executing: " cmd)
+        (jdbc/db-do-commands (db-spec db) cmd))
+      (log/info "Updating version to: " version)
+      (jdbc/db-do-commands (db-spec db) (update-schema-version version-table version))))))
 
 (defn- validate-commands
   [commands]
