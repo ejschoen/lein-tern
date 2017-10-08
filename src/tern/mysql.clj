@@ -92,7 +92,7 @@
                    (not (some (fn [prior]
                                 (and (= table (:alter-table prior))
                                      (some (fn [col] (= col column)) (:drop-columns prior))))
-                              *plan*)))
+                              @*plan*)))
             (do (log/info (format "   * Skipping ADD COLUMN %s.%s because it already exists."
                                   (to-sql-name table) (to-sql-name column)))
                 nil)
@@ -131,7 +131,7 @@
                           (and (= table (:alter-table prior))
                                (some (fn [[cons & specs]] (= cons constraint))
                                      (:drop-constraints prior))))
-                        *plan*))
+                        @*plan*))
             (do
               (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
               (format "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
@@ -175,8 +175,8 @@
            (index-exists? *db* (to-sql-name table) (to-sql-name index))
            (not (some (fn [prior]
                         (and (= index (:drop-index prior))
-                             (= table (:on prior)))))
-                      *plan*))
+                             (= table (:on prior))))
+                      @*plan*)))
     (do (log/info (format "   * Skipping CREATE INDEX on table %s name %s because it already exists."
                           (to-sql-name table) (to-sql-name index)))
         nil)
