@@ -1,12 +1,15 @@
 (ns tern.implementations
   (:require [tern.postgresql :as postgresql]
             [tern.mysql      :as mysql]
+            [tern.h2         :as h2]
             [tern.log        :as log]))
 
 (def ^{:doc "A map of available migrator implementations."
        :private true}
   constructor-store
-  (atom {:postgresql postgresql/->PostgresqlMigrator :mysql mysql/->MysqlMigrator}))
+  (atom {:postgresql postgresql/->PostgresqlMigrator
+         :mysql mysql/->MysqlMigrator
+         :h2 h2/->H2Migrator}))
 
 (defn register!
   "Register a new tern implementation. This function
@@ -24,5 +27,5 @@
   (if-let [new-impl (@constructor-store (keyword subprotocol))]
     (new-impl config)
     (do
-      (log/error "Sorry, support for" subprotocol "is not implemented yet.")
+      (log/error "Sorry, support for" (pr-str subprotocol) "is not implemented yet.")
       (System/exit 1))))
