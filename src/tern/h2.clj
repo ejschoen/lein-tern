@@ -6,7 +6,7 @@
   (:import [java.util Date]
            [java.sql PreparedStatement Timestamp]))
 
-(declare foreign-key-exists? index-exists? column-exists? table-exists? get-column-definition not-indexable-type?)
+(declare foreign-key-exists? get-matching-foreign-keys index-exists? column-exists? table-exists? get-column-definition not-indexable-type?)
 
 (def ^:dynamic *db* nil)
 (def ^:dynamic *plan* nil)
@@ -34,10 +34,13 @@
     (or (re-matches #"(?i)CHARACTER SET .+" s)
         (re-matches #"(?i)COLLATE .+" s))))
 
+(def ^:private column-spec-map
+  {"DEFAULT NULL" "NULL"})
+
 (defn ^:private remove-unsupported-column-specs
   [specs]
   (for [spec specs :when (not (unsupported-column-spec spec))]
-    spec))
+    (get column-spec-map spec spec)))
    
 (defn generate-pk
   [{:keys [primary-key] :as command}]
@@ -149,23 +152,45 @@
                       (to-sql-name column)
                       (s/join " " (remove-unsupported-column-specs specs)))))
         new-constraints
-        (for [[constraint & specs] add-constraints]
-          (if (or (not *db*)
-                  (not (foreign-key-exists? *db* (to-sql-name constraint)))
-                  (some (fn [prior]
-                          ;; Did we previously drop the constraint?
-                          (and (= table (:alter-table prior))
-                               (some (fn [[cons & specs]] (= cons constraint))
-                                     (:drop-constraints prior))))
-                        @*plan*))
-            (do
-              (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
-              (format "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
-                      (to-sql-name table)
-                      (to-sql-name constraint)
-                      (s/join  " " specs)))
-            (log/info "    * Skipping adding constraint " (log/highlight (if constraint constraint "unnamed"))
-                      " because it already exists")))
+        (mapcat (fn [[constraint & specs]]
+                  (let [spec-sql (s/join " " specs)
+                        [_ fkcolumn pktable pkcolumn] (re-matches #"\(([\w_]+)\)\s+REFERENCES\s+([\w_]+)\(([\w_]+)\).*" spec-sql)
+                        _ (if (or (nil? fkcolumn) (nil? pktable) (nil? pkcolumn))
+                            (log/error "Failed to parse constraint for" constraint ":" spec-sql))
+                        existing-constraints (get-matching-foreign-keys *db* (to-sql-name table) (to-sql-name fkcolumn)
+                                                                        (to-sql-name pktable) (to-sql-name pkcolumn))
+                        undropped-existing-constraints (filter (fn [existing]
+                                                                 (not (some (fn [prior]
+                                                                              (some (fn [to-drop]
+                                                                                      (= (s/upper-case (to-sql-name to-drop))
+                                                                                         (s/upper-case (to-sql-name existing))))
+                                                                                    (:drop-constraints prior)))
+                                                                            @*plan*)))
+                                                               existing-constraints)]
+                    (if (or (not *db*)
+                            (not (foreign-key-exists? *db* (to-sql-name constraint)))
+                            (some (fn [prior]
+                                    ;; Did we previously drop the constraint?
+                                    (and (= table (:alter-table prior))
+                                         (some (fn [[cons & specs]] (= cons constraint))
+                                               (:drop-constraints prior))))
+                                  @*plan*))
+                      (do
+                        (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
+                        (concat (into []
+                                      (for [undropped-constraint undropped-existing-constraints]
+                                        (do (log/info "    * Dropping foreign key" undropped-constraint "because it is being replaced")
+                                            (format "ALTER TABLE %s DROP FOREIGN KEY %s"
+                                                    (s/upper-case (to-sql-name table))
+                                                    (s/upper-case (to-sql-name undropped-constraint))))))
+                                [(format "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
+                                         (to-sql-name table)
+                                         (to-sql-name constraint)
+                                         spec-sql)]))
+                      (do (log/info "    * Skipping adding constraint " (log/highlight (if constraint constraint "unnamed"))
+                                    " because it already exists")
+                          nil))))
+                add-constraints)
        old-constraints
        (for [constraint drop-constraints]
          ;; As with drop-column, we are not checking here for add constraint followed by drop constraint
@@ -179,8 +204,9 @@
                      (to-sql-name constraint)))
            (log/info "   * Skipping removing constraint " (log/highlight constraint) " because it does not exist")))
         options
-        (do (log/info "   * Skipping options " table-options " because H2 does not support them")
-            [])
+        (when (not-empty table-options)
+          (log/info "   * Skipping options " table-options " because H2 does not support them")
+          [])
         charset
         (when character-set
           (log/info "   * Skipping convert to character set because H2 does not support it.")
@@ -279,7 +305,19 @@
     ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (:database db)]
     :result-set-fn first))
 
-(defn- foreign-key-exists?
+(defn get-matching-foreign-keys
+  [db fktable fkcolumn pktable pkcolumn]
+  (map :fk_name
+       (jdbc/query
+        (db-spec db)
+        [(str "select fk_name from information_schema.cross_references where fktable_schema=SCHEMA() AND fktable_name=? AND fkcolumn_name=? AND "
+              "pktable_schema=SCHEMA() AND pktable_name=? AND pkcolumn_name=?")
+         (s/upper-case fktable)
+         (s/upper-case fkcolumn)
+         (s/upper-case pktable)
+         (s/upper-case pkcolumn)])))
+
+(defn foreign-key-exists?
   [db fk]
   (if db
     (jdbc/query
