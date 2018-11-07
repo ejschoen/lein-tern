@@ -22,7 +22,7 @@
 (defn subname
   "Build the db subname from its component parts"
   [{:keys [host port database] :as db}]
-  (cond (and (not-empty host) (not-empty port))
+  (cond (and (not-empty host) (not (nil? port)))
         (str "//" host ":" port "/" database)
         (not-empty host)
         (str "//" host "/" database)
