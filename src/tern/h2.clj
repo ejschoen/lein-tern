@@ -301,8 +301,8 @@
 (defn- database-exists?
   [db]
   (jdbc/query
-    (db-spec db "h2")
-    ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (:database db)]
+    (db-spec db)
+    ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (:schema db "PUBLIC")]
     :result-set-fn first))
 
 (defn get-matching-foreign-keys
@@ -375,8 +375,8 @@
 (defn- create-database
   [db]
   (jdbc/db-do-commands
-    (db-spec db "h2") false
-    (format "CREATE DATABASE %s" (:database db))))
+    (db-spec db) false
+    (format "CREATE SCHEMA %s" (:schema db "PUBLIC"))))
 
 (defn- create-version-table
   [db version-table]
@@ -385,7 +385,7 @@
          (generate-sql
            {:create-table version-table
             :columns [[:version "VARCHAR(14)" "NOT NULL"]
-                      [:created "BIGINT"      "NOT NULL"]]})))
+                      [:created "timestamp"      "NOT NULL" "default CURRENT_TIMESTAMP"]]})))
 
 (defn- psql-error-message
   [e]
@@ -397,13 +397,12 @@
 
 (defn- init-db!
   [{:keys [db version-table]}]
-  (try
-    (when-not (database-exists? db)
-      (create-database db)
-      (log/info "Created database:" (:database db)))
-    (when-not (table-exists? db version-table)
-      (create-version-table db version-table)
-      (log/info "Created table:   " version-table))))
+  (when-not (database-exists? db)
+    (create-database db)
+    (log/info "Created database:" (:schema db "PUBLIC")))
+  (when-not (table-exists? db version-table)
+    (create-version-table db version-table)
+    (log/info "Created table:   " version-table)))
 
 (defn- get-version
   [{:keys [db version-table]}]
