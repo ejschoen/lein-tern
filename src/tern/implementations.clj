@@ -20,6 +20,11 @@
   [k constructor]
   (swap! constructor-store assoc k constructor))
 
+(defn can-migrate?
+  "Return boolean that indicates whether a database with the given subprotocol is supported."
+  [subprotocol]
+  (not (nil? (@constructor-store (keyword subprotocol)))))
+
 (defn factory
   "Factory create a `Migrator` for the given DB
   implementation and config."
@@ -29,3 +34,4 @@
     (do
       (log/error "Sorry, support for" (pr-str subprotocol) "is not implemented yet.")
       (System/exit 1))))
+

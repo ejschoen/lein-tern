@@ -33,20 +33,25 @@
                               (.getPath fs resource-path (make-array String 0)))
                       "file" (Paths/get root)
                       (Paths/get root))
-        ^Stream walk (Files/walk path (make-array FileVisitOption 0))]
+        ^Stream walk (Files/walk path (into-array FileVisitOption [FileVisitOption/FOLLOW_LINKS]))]
     (log/info "Will walk this path:" path)
     (iterator-seq (.iterator walk))
     ))
 
 (defmethod enumerate-files java.net.URL [root]
-  (enumerate-files (.toURI root))
-)
+  (if root
+    (enumerate-files (.toURI root))
+    []))
 
 
 (defn- get-migrations
   "Returns a sequence of all migration files, sorted by name."
   [{:keys [migration-dir]}]
-  (->> (enumerate-files (.toURI (.getResource (type get-migration) migration-dir)))
+  (->> (enumerate-files (or (io/resource migration-dir)
+                            (try (.toURI (.getResource (type get-migration) migration-dir))
+                                 (catch Exception e
+                                   (log/error (format "Unable to find migration resource in %s" migration-dir))
+                                   nil))))
        (filter edn?)
        (sort-by fname)))
 
