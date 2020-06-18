@@ -326,9 +326,9 @@
 (defn- database-exists?
   [db]
   (jdbc/query
-    (db-spec db)
-    ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (:schema db "PUBLIC")]
-    :result-set-fn first))
+   (db-spec db)
+   ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (:schema db "PUBLIC")]
+   :result-set-fn first))
 
 (defn get-matching-foreign-keys
   [db fktable fkcolumn pktable pkcolumn]

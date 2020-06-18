@@ -83,6 +83,7 @@
   :alter-table
   [{table :alter-table add-columns :add-columns drop-columns :drop-columns modify-columns :modify-columns
     add-constraints :add-constraints  drop-constraints :drop-constraints
+    primary-key :primary-key
     table-options :table-options character-set :character-set}]
   (log/info " - Altering table" (log/highlight (name table)))
   (let [additions
@@ -121,6 +122,10 @@
               (format "MODIFY COLUMN %s %s"
                       (to-sql-name column)
                       (s/join " " specs))))
+        primary-key-constraints
+        (if primary-key
+          [(generate-pk {:primary-key primary-key})]
+          [])
         new-constraints
         (filter identity
                 (for [[constraint & specs] add-constraints]
@@ -171,7 +176,7 @@
     [(format "ALTER TABLE %s %s"
              (to-sql-name table)
              (s/join ", "
-                     (concat options charset old-constraints removals additions modifications new-constraints)))]))
+                     (concat options charset old-constraints removals additions modifications primary-key-constraints new-constraints)))]))
 
 (defmethod generate-sql
   :create-index
