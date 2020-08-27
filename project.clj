@@ -1,11 +1,11 @@
-(defproject cc.artifice/lein-tern "0.6.0"
+(defproject cc.artifice/lein-tern "0.6.1"
   :description "Migrations as data"
   :url "http://github.com/artifice-cc/lein-tern"
   :license {:name "MIT"
             :url "http://opensource.org/licenses/MIT"}
   :scm  {:name "git"
          :url "https://github.com/artifice-cc/lein-tern"}
-  :dependencies [[org.clojure/clojure "1.6.0"]
+  :dependencies [[org.clojure/clojure "1.8.0"]
                  [clj-time "0.11.0"]
                  [org.clojure/java.jdbc "0.4.2"]
                  [postgresql "9.3-1102.jdbc41"]
