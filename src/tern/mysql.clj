@@ -169,7 +169,7 @@
         charset
         (when character-set
           [(str
-            (format " CONVERT TO CHARACTER SET %s" (to-sql-name table) (:charset-name character-set))
+            (format " CONVERT TO CHARACTER SET %s" (:charset-name character-set))
             (if (:collation character-set)
               (format " COLLATE %s" (:collation character-set))
               ""))])]

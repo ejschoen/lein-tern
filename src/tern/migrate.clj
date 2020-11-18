@@ -8,7 +8,7 @@
             [clojure.string  :as s])
   (:import [java.nio.file FileSystems FileSystem Path Paths Files FileVisitOption OpenOption]
            [java.nio.file.spi FileSystemProvider]
-           [java.net URI URL]
+           [java.net URI URL URLEncoder]
            [java.io File]
            [java.util Collections]
            [java.util.stream Stream]))
@@ -28,7 +28,7 @@
                                                              nil))
                                                       (FileSystems/newFileSystem ^URI root (Collections/emptyMap)))
                                   scheme-specific (.getSchemeSpecificPart root)
-                                  scheme-path (.getPath (URI. scheme-specific))
+                                  scheme-path (.getPath (URI. (s/replace scheme-specific #" " "%20")))
                                   resource-path (second (re-matches #".+!(.+)" scheme-path))]
                               (.getPath fs resource-path (make-array String 0)))
                       "file" (Paths/get root)
@@ -48,7 +48,7 @@
   "Returns a sequence of all migration files, sorted by name."
   [{:keys [migration-dir]}]
   (->> (enumerate-files (or (io/resource migration-dir)
-                            (try (.toURI (.getResource (type get-migration) migration-dir))
+                            (try (URI. (s/replace (str (.getResource (type get-migration) migration-dir)) #" " "%20"))
                                  (catch Exception e
                                    (log/error (format "Unable to find migration resource in %s" migration-dir))
                                    nil))))
