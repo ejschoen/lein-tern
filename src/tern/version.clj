@@ -1,3 +1,3 @@
 (ns tern.version)
-(def tern-version "0.6.3")
+(def tern-version "0.7.0")
 

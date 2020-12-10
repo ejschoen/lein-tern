@@ -2,6 +2,7 @@
   (:require [tern.postgresql :as postgresql]
             [tern.mysql      :as mysql]
             [tern.h2         :as h2]
+            [tern.sqlserver  :as sqlserver]
             [tern.log        :as log]))
 
 (def ^{:doc "A map of available migrator implementations."
@@ -9,7 +10,9 @@
   constructor-store
   (atom {:postgresql postgresql/->PostgresqlMigrator
          :mysql mysql/->MysqlMigrator
-         :h2 h2/->H2Migrator}))
+         :h2 h2/->H2Migrator
+         :sqlserver sqlserver/->SqlServerMigrator
+         }))
 
 (defn register!
   "Register a new tern implementation. This function
