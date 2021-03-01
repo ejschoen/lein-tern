@@ -36,5 +36,6 @@
     (new-impl config)
     (do
       (log/error "Sorry, support for" (pr-str subprotocol) "is not implemented yet.")
+      (log/error "Supported versions are" (keys @constructor-store))
       (System/exit 1))))
 
