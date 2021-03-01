@@ -1,6 +1,7 @@
 (ns tern.implementations
   (:require [tern.postgresql :as postgresql]
             [tern.mysql      :as mysql]
+            [tern.sqlite     :as sqlite]
             [tern.h2         :as h2]
             [tern.sqlserver  :as sqlserver]
             [tern.log        :as log]))
@@ -11,6 +12,7 @@
   (atom {:postgresql postgresql/->PostgresqlMigrator
          :mysql mysql/->MysqlMigrator
          :h2 h2/->H2Migrator
+         :sqlite sqlite/->SQLiteMigrator
          :sqlserver sqlserver/->SqlServerMigrator
          }))
 
