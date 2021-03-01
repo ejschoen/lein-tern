@@ -47,11 +47,14 @@
 (defn- get-migrations
   "Returns a sequence of all migration files, sorted by name."
   [{:keys [migration-dir]}]
+  (log/info "get-migrations called with migration-dir " migration-dir)
   (->> (enumerate-files (or (io/resource migration-dir)
-                            (try (URI. (s/replace (str (.getResource (type get-migration) migration-dir)) #" " "%20"))
-                                 (catch Exception e
-                                   (log/error (format "Unable to find migration resource in %s" migration-dir))
-                                   nil))))
+                            (when-let [r (.getResource (type get-migration) migration-dir)] 
+                              (try (URI. (s/replace (str r) #" " "%20"))
+                                    (catch Exception e
+                                      (log/error (format "Unable to find migration resource in %s" migration-dir))
+                                      nil)))
+                            (io/as-file migration-dir)))
        (filter edn?)
        (sort-by fname)))
 
