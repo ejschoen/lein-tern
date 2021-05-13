@@ -82,7 +82,13 @@
    [#"(?i)tinyint\(\d+\)" "tinyint"]
    [#"(?i)double" "float"]
    [#"^\(\d+\)$" ""]
-   (fn [spec]
+   (fn [spec column-name]
+     (if-let [[_ columns] (re-matches #"(?)ENUM\(([^\)]+)\)" spec)]
+       (let [column-strings (map #(subs % 1 (dec (count %))) (s/split columns #","))
+             field-size (apply max (map count column-strings))]
+         (format "VARCHAR(%d) CHECK (%s IN(%s))" field-size (name column-name) columns))
+       spec))
+   (fn [spec column-name]
      (if-let [[_ size-str] (re-matches #"(?i)VARBINARY\((\d+)\)" spec)]
        (let [size (Integer/parseInt size-str)]
          (if (> size 8000)
@@ -92,12 +98,12 @@
    ])
 
 (defn map-column-spec-token
-  [token]
+  [token column-name]
   (-> token
       ((fn [d] (column-spec-map (s/lower-case d) d)))
       ((fn [d] (reduce (fn [d replacement]
                          (if (fn? replacement)
-                           (replacement d)
+                           (replacement d column-name)
                            (let [[pattern replacement] replacement]
                              (s/replace d pattern replacement))))
                        d
@@ -106,7 +112,7 @@
 (defn map-column-specs
   [column-specs]
   (for [[name & rest] column-specs]
-    (into [] (cons name (map map-column-spec-token rest)))))
+    (into [] (cons name (map #(map-column-spec-token % name) rest)))))
 
 (defmethod generate-sql
   :create-table
@@ -419,7 +425,7 @@
          (generate-sql
            {:create-table version-table
             :columns [[:version "VARCHAR(14)" "NOT NULL"]
-                      [:created "BIGINT"      "NOT NULL"]]})))
+                      [:created "datetime"      "NOT NULL"]]})))
 
 (defn- psql-error-message
   [e]
