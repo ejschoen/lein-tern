@@ -333,9 +333,8 @@
   [{:keys [db version-table]} version commands]
   (when-not (vector? commands)
     (log/error "Values for `up` and `down` must be vectors of commands"))
-  (try
-    (binding [*db* db
-              *plan* (atom [])]
+  (binding [*db* db
+            *plan* (atom [])]
     (let [sql-commands (into [] (mapcat
                                  (fn [command]
                                    (let [sql (generate-sql command)]
@@ -344,9 +343,12 @@
                                  commands))]
       (doseq [cmd sql-commands]
         (log/info "Executing: " cmd)
-        (jdbc/db-do-commands db cmd))
+        (try (jdbc/db-do-commands db cmd)
+             (catch Exception e
+               (log/error "Error executing SQL command" cmd (.getMessage e))
+               (throw e))))
       (log/info "Updating version to: " version)
-      (jdbc/db-do-commands db (update-schema-version version-table version))))))
+      (jdbc/db-do-commands db (update-schema-version version-table version)))))
 
 (defn- validate-commands
   [commands]

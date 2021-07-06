@@ -192,7 +192,7 @@
             (do (log/info "    * Modifying column" (log/highlight (name column)))
                 [(format "ALTER COLUMN %s %s"
                          (to-sql-name column)
-                         (s/join " " (map map-column-spec-token specs)))]))
+                         (s/join " " (map #(map-column-spec-token % column) specs)))]))
           nil)
         primary-key-constraints
         (if primary-key
