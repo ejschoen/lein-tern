@@ -6,7 +6,7 @@
         (generate-sql {:create-table :foo :columns [[:a "INT"]]}))
 
 (expect ["CREATE TABLE foo (a VARCHAR(7) CHECK (a IN('Hello','Goodbye')))"]
-        (generate-sql {:create-table :foo :columns [[:a "ENUM('Hello','Goodbye')"]]})
+        (generate-sql {:create-table :foo :columns [[:a "ENUM('Hello','Goodbye')"]]}))
 
 (expect ["CREATE TABLE foo (PRIMARY KEY (a), a INT"]
         (generate-sql {:create-table :foo :columns [[:a "INT"]] :primary-key [:a]}))

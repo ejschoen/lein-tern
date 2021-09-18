@@ -105,9 +105,9 @@
 
 (defn run
   "Run the given migration."
-  [impl migration]
+  [impl ^Path migration]
   (let [version  (parse-version migration)
-        commands (with-open [s (path->stream migration)]
+        commands (with-open [^java.io.InputStream s (path->stream migration)]
                    (-> s slurp edn/read-string :up))]
     (db/migrate impl version commands)))
 
@@ -115,8 +115,8 @@
   "Roll back the given migration. Uses the same code as applying a migration,
   but simply passes the `down` commands and the version of the migration that's
   being rolled back to."
-  [impl migration version]
-  (let [commands (with-open [s (path->stream migration)]
+  [impl ^Path migration version]
+  (let [commands (with-open [s (path->stream ^Path migration)]
                    (-> s slurp edn/read-string :down))]
         (db/migrate impl version commands)))
 
@@ -124,6 +124,6 @@
   "Roll back ALL migrations."
   [{:keys [config] :as impl} version]
   (let [migrations (reverse (completed config version))]
-    (doseq [migration migrations]
-      (rollback impl migration
-                (previous-version config (parse-version migration))))))
+    (doseq [^Path migration migrations]
+      (rollback impl ^Path migration
+                (previous-version config (parse-version ^Path migration))))))
