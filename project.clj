@@ -1,4 +1,4 @@
-(defproject cc.artifice/lein-tern "0.8.1"
+(defproject cc.artifice/lein-tern "0.8.2"
   :description "Migrations as data"
   :url "http://github.com/artifice-cc/lein-tern"
   :license {:name "MIT"

@@ -26,7 +26,9 @@
                       "jar" (let [^FileSystems fs (or (try (FileSystems/getFileSystem ^URI root)
                                                            (catch java.nio.file.FileSystemNotFoundException _
                                                              nil))
-                                                      (FileSystems/newFileSystem ^URI root (Collections/emptyMap)))
+                                                      (try (FileSystems/newFileSystem ^URI root (Collections/emptyMap))
+                                                           (catch java.nio.file.FileSystemAlreadyExistsException _
+                                                             (FileSystems/getFileSystem ^URI root))))
                                   scheme-specific (.getSchemeSpecificPart root)
                                   scheme-path (.getPath (URI. (s/replace scheme-specific #" " "%20")))
                                   resource-path (second (re-matches #".+!(.+)" scheme-path))]
