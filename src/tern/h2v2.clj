@@ -2,7 +2,8 @@
   (:require [tern.db           :refer :all]
             [tern.log          :as log]
             [clojure.java.jdbc :as jdbc]
-            [clojure.string    :as s])
+            [clojure.string    :as s]
+            [clojure.set       :as set])
   (:import [java.util Date]
            [java.sql PreparedStatement Timestamp]))
 
@@ -55,6 +56,7 @@
 (defn to-h2-name
   [name]
   (-> (tern.db/to-sql-name name)
+      s/upper-case
       quote-reserved-name))
 
 (defn ^:private remove-unsupported-column-specs
@@ -139,6 +141,10 @@
   (log/info " - Dropping table" (log/highlight (name table)))
   [(jdbc/drop-table-ddl table)])
 
+(defn cleanup-constraints
+  [table added-constraints]
+  )
+
 (defmethod generate-sql
   :alter-table
   [{table :alter-table add-columns :add-columns drop-columns :drop-columns modify-columns :modify-columns
@@ -205,16 +211,22 @@
                                   [_ fkcolumn pktable pkcolumn] (re-matches #"(?i)\(([\w_]+)\)\s+REFERENCES\s+([\w_]+)\(([\w_]+)\).*" spec-sql)
                                   _ (if (or (nil? fkcolumn) (nil? pktable) (nil? pkcolumn))
                                       (log/error "Failed to parse constraint for" constraint ":" spec-sql))
-                                  existing-constraints (get-matching-foreign-keys *db* (to-h2-name table) (to-h2-name fkcolumn)
-                                                                                  (to-h2-name pktable) (to-h2-name pkcolumn))
-                                  undropped-existing-constraints (filter (fn [existing]
-                                                                           (not (some (fn [prior]
-                                                                                        (some (fn [to-drop]
-                                                                                                (= (s/upper-case (to-h2-name to-drop))
-                                                                                                   (s/upper-case (to-h2-name existing))))
-                                                                                              (:drop-constraints prior)))
-                                                                                      @*plan*)))
-                                                                         existing-constraints)]
+                                  foreign-keys (get-matching-foreign-keys *db* (to-h2-name table) (to-h2-name fkcolumn)
+                                                                          (to-h2-name pktable) (to-h2-name pkcolumn))
+                                  existing-constraints (map (comp s/upper-case to-h2-name :constraint_name) foreign-keys)
+                                  duplicate-constraints (disj (set existing-constraints) (s/upper-case (to-h2-name constraint)))
+                                  undropped-existing-constraints (set/union 
+                                                                  (map (comp s/upper-case name) duplicate-constraints) 
+                                                                  (set (filter 
+                                                                        (fn [existing]
+                                                                          (not 
+                                                                           (some 
+                                                                            (fn [prior]
+                                                                              (some (fn [to-drop]
+                                                                                      (= (s/upper-case (to-h2-name to-drop)) existing))
+                                                                                    (:drop-constraints prior)))
+                                                                                     @*plan*)))
+                                                                        existing-constraints)))]
                               (if (or (not *db*)
                                       (not (foreign-key-exists? *db* (to-h2-name constraint)))
                                       (some (fn [prior]
@@ -226,9 +238,12 @@
                                 (do
                                   (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
                                   (concat (into []
-                                                (for [undropped-constraint undropped-existing-constraints]
+                                                (for [undropped-constraint (set/difference 
+                                                                            duplicate-constraints
+                                                                            (set (map (comp s/upper-case to-h2-name name) drop-constraints)))  
+                                                      #_(distinct undropped-existing-constraints)]
                                                   (do (log/info "    * Dropping foreign key" undropped-constraint "because it is being replaced")
-                                                      (format "ALTER TABLE %s DROP CONSTRAINT %s"
+                                                      (format "ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s"
                                                               (to-h2-name table)
                                                               (s/upper-case (to-h2-name undropped-constraint))))))
                                           [(format "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY %s" 
@@ -239,26 +254,28 @@
                                               " because it already exists")
                                     nil))))
                           add-constraints))
-        old-constraints (filter identity
-                                (for [constraint drop-constraints]
-                                  ;; As with drop-column, we are not checking here for add constraint followed by drop constraint
-                                  ;; in the same migration.  Wouldn't make sense.
-                                  (if (= constraint :primary-key)
-                                    (if (or (not *db*)
-                                            (primary-key-exists? *db* (to-h2-name table)))
-                                      (do
-                                        (log/info "    * Removing primary key from " (log/highlight table))
-                                        (format "ALTER TABLE %s DROP PRIMARY KEY",
-                                                (to-h2-name table)))
-                                      (log/info "   * Skipping removing primary key from " (log/highlight table) " because it does not have one"))
-                                    (if (or (not *db*)
-                                            (foreign-key-exists? *db* (to-h2-name constraint)))
-                                      (do
-                                        (log/info "    * Removing constraint " (log/highlight constraint))
-                                        (format "ALTER TABLE %s DROP CONSTRAINT %s",
-                                                (to-h2-name table)
-                                                (to-h2-name constraint)))
-                                      (log/info "   * Skipping removing constraint " (log/highlight constraint) " because it does not exist")))))
+        old-constraints (distinct 
+                         (filter
+                          identity
+                          (for [constraint drop-constraints]
+                            ;; As with drop-column, we are not checking here for add constraint followed by drop constraint
+                            ;; in the same migration.  Wouldn't make sense.
+                            (if (= constraint :primary-key)
+                              (if (or (not *db*)
+                                      (primary-key-exists? *db* (to-h2-name table)))
+                                (do
+                                  (log/info "    * Removing primary key from " (log/highlight table))
+                                  (format "ALTER TABLE %s DROP PRIMARY KEY",
+                                          (to-h2-name table)))
+                                (log/info "   * Skipping removing primary key from " (log/highlight table) " because it does not have one"))
+                              (if (or (not *db*)
+                                      (foreign-key-exists? *db* (to-h2-name constraint)))
+                                (do
+                                  (log/info "    * Removing constraint " (log/highlight constraint))
+                                  (format "ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s",
+                                          (to-h2-name table)
+                                          (to-h2-name constraint)))
+                                (log/info "   * Skipping removing constraint " (log/highlight constraint) " because it does not exist")))))) 
         options
         (when (not-empty table-options)
           (log/info "   * Skipping options " table-options " because H2 does not support them")
@@ -373,27 +390,30 @@
              (jdbc/query 
               (db-spec db)
               [(str "select constraint_name from information_schema.table_constraints "
-                    "where table_name=? and constraint_type='foreign key' and constraint_schema=SCHEMA()") 
-               fktable]))
+                    "where table_name=? and constraint_type='FOREIGN KEY' and constraint_schema=SCHEMA()") 
+               (s/upper-case fktable )]))
         primary-key-constraints
         (for [fk foreign-key-constraints]
           (:unique_constraint_name
-           (first (jdbc/query
-                   (db-spec db)
-                   [(str "select unique_constraint_name from information_schema.referential_constraints "
-                         "where constraint_name=? and constraint_schema=SCHEMA()")
-                    ])))) 
+           (jdbc/query
+            (db-spec db)
+            [(str "select unique_constraint_name from information_schema.referential_constraints "
+                  "where constraint_name=? and constraint_schema=SCHEMA()")
+             fk]
+            :result-set-fn first))) 
         constraints (map (fn [fk pk]
                            (let [fkcol (jdbc/query 
                                         (db-spec db)
                                         [(str "select table_name,column_name,constraint_name from information_schema.constraint_column_usage "
-                                              "where constraint_name=? and constraint_schema=SCHEMA()")
-                                         fk])
+                                              "where table_name=? and constraint_name=? and constraint_schema=SCHEMA()")
+                                         fktable fk]
+                                        :result-set-fn first)
                                  pkcol (jdbc/query 
                                         (db-spec db)
                                         [(str "select table_name,column_name from information_schema.constraint_column_usage "
                                               "where constraint_name=? and constraint_schema=SCHEMA()")
-                                         pk])]
+                                         pk]
+                                        :result-set-fn first)]
                              {:constraint_name (:constraint_name fkcol)
                               :fktable (:table_name fkcol) :fkcolumn (:column_name fkcol)
                               :pktable (:table_name pkcol) :pkcolumn (:column_name pkcol)}))
@@ -403,8 +423,7 @@
                    (and (= (s/upper-case fktable) (:fktable constraint))
                         (= (s/upper-case fkcolumn) (:fkcolumn constraint))
                         (= (s/upper-case pktable) (:pktable constraint))
-                        (= (s/upper-case pkcolumn) (:pkcolumn constraint)))))
-         (map :constraint_name))))
+                        (= (s/upper-case pkcolumn) (:pkcolumn constraint))))))))
 
 (defn primary-key-exists?
   [db table]
@@ -535,7 +554,7 @@
       #_(doseq [column (jdbc/query (db-spec db)
                                  ["select * from information_schema.columns where table_schema=SCHEMA() and table_name=? and column_name=?"
                                   "TAXNODES" "PATH"])]
-        (println (pr-str column)))
+          (println (pr-str column)))
       (let [sql-commands (into [] (mapcat
                                    (fn [command]
                                      (let [sql (generate-sql command)]
