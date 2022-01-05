@@ -502,4 +502,5 @@
   (version [this]
     (or (get-version config) "0"))
   (migrate [this version commands]
+    (log/info "This is the H2 migrator for version 1.x.y of H2")
     (run-migration! config version (validate-commands commands))))
