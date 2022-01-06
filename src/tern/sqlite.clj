@@ -27,8 +27,7 @@
         (when constraints
           (for [[constraint & specs] constraints]
             (do
-              (format "CONSTRAINT %s FOREIGN KEY %s"
-                      (to-sql-name constraint)
+              (format "FOREIGN KEY %s"
                       (s/join " " specs)))))]
     (when fks (map (fn [fk] [fk]) fks))))
 
@@ -256,17 +255,6 @@
     false
     false))
 
-(defn- index-exists?
-  [db table index]
-  (if db
-    (do 
-      ;;(log/info (format "   * Testing whether table %s has index %s" table index))
-      (jdbc/query
-       db
-       ["SELECT 1 from pragma_index_list(?) where name=?" table index]
-       :result-set-fn first))
-    false))
-
 (defn- table-exists?
   [db table]
   (jdbc/query
@@ -274,12 +262,27 @@
    ["SELECT 1 FROM sqlite_master WHERE type='table' and name = ?" table]
    :result-set-fn first))
 
+(defn- index-exists?
+  [db table index]
+  (if db
+    (if (table-exists? db table)
+      (do 
+        ;;(log/info (format "   * Testing whether table %s has index %s" table index))
+        (jdbc/query
+         db
+         ["SELECT 1 from pragma_index_list(?) where name=?" table index]
+         :result-set-fn first))
+      false)
+    false))
+
 (defn- column-exists?
   [db table column]
-  (jdbc/query
-   db
-   ["SELECT 1 from pragma_table_info(?) where name=?" table column]
-   :result-set-fn first))
+  (if (table-exists? db table)
+    (jdbc/query
+     db
+     ["SELECT 1 from pragma_table_info(?) where name=?" table column]
+     :result-set-fn first)
+    false))
 
 (defn- create-database
   [db]
