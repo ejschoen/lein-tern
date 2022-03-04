@@ -8,7 +8,7 @@
 (expect ["CREATE TABLE foo (a VARCHAR(7) CHECK (a IN('Hello','Goodbye')))"]
         (generate-sql {:create-table :foo :columns [[:a "ENUM('Hello','Goodbye')"]]}))
 
-(expect ["CREATE TABLE foo (PRIMARY KEY (a), a INT"]
+(expect ["CREATE TABLE foo (PRIMARY KEY (a), a INT)"]
         (generate-sql {:create-table :foo :columns [[:a "INT"]] :primary-key [:a]}))
 
 (expect ["CREATE TABLE foo (CONSTRAINT fk_a FOREIGN KEY (a) REFERENCES foo(a), a INT)"]
@@ -17,7 +17,7 @@
 (expect ["CREATE TABLE foo (CONSTRAINT fk_a FOREIGN KEY (a) REFERENCES foo(a), PRIMARY KEY (a), a INT)"]
         (generate-sql {:create-table :foo :columns [[:a "INT"]] :primary-key [:a] :constraints [[:fk_a "(a) REFERENCES foo(a)"]]}))
 
-(expect ["INSERT INTO foo VALUES (1,2,\"foo\"),(3,4,\"bar\")"]
+(expect ["INSERT INTO foo() VALUES (1,2,'foo'),(3,4,'bar')"]
         (generate-sql {:insert-into :foo :values [[1 2 "foo"] [3 4 "bar"]]}))
 
 (expect '("ALTER TABLE foo ADD CONSTRAINT fk_foo_bar FOREIGN KEY (bar_id) REFERENCES bar(id)")

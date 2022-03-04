@@ -322,7 +322,7 @@
     (jdbc/query
       db
       [(format "SELECT version FROM %s
-                  ORDER BY version DESC
+                  ORDER BY created DESC, version DESC
                   LIMIT 1" version-table)]
       :row-fn :version
       :result-set-fn first)))
