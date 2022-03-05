@@ -451,7 +451,7 @@
     (jdbc/query
       (db-spec db)
       [(format "SELECT TOP 1 version FROM %s
-                  ORDER BY version DESC"
+                  ORDER BY created DESC, version DESC"
                version-table)]
       :row-fn :version
       :result-set-fn first)))
