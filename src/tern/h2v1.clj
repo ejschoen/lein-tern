@@ -161,11 +161,11 @@
           (if (or (not (primary-key-exists? *db* (to-sql-name table)))
                   (some (fn [prior]
                           (some (fn [to-drop]
-                                  (= :primary-key to-drop)
-                                  (:drop-constraints prior))))
+                                  (= :primary-key to-drop))
+                                (:drop-constraints prior)))
                         @*plan*))
             (do (log/info "   * Adding primary key to table " (log/highlight table))
-                [(format "ALTER TABLE %S ADD PRIMARY KEY %s"
+                [(format "ALTER TABLE %S ADD %s"
                          (to-sql-name table)
                          (generate-pk {:primary-key primary-key}))])
             (do (log/info "   * Not adding primary key to " (log/highlight table) " because it already exists")
