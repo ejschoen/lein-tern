@@ -158,7 +158,12 @@
                                                      (s/join " " (remove-unsupported-column-specs specs))))))
         primary-key-constraints
         (if primary-key
-          (if (not (primary-key-exists? *db* (to-sql-name table)))
+          (if (or (not (primary-key-exists? *db* (to-sql-name table)))
+                  (some (fn [prior]
+                          (some (fn [to-drop]
+                                  (= :primary-key to-drop)
+                                  (:drop-constraints prior))))
+                        @*plan*))
             (do (log/info "   * Adding primary key to table " (log/highlight table))
                 [(format "ALTER TABLE %S ADD PRIMARY KEY %s"
                          (to-sql-name table)

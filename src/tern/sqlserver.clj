@@ -196,7 +196,7 @@
           nil)
         primary-key-constraints
         (if primary-key
-          [(generate-pk {:primary-key primary-key})]
+          [(str "ADD " (generate-pk {:primary-key primary-key}))]
           [])
         new-constraints
         (filter identity
