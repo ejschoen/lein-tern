@@ -6,7 +6,7 @@
   (:import [java.util Date]
            [java.sql PreparedStatement Timestamp]))
 
-(declare primary-key-exists? get-primary-key foreign-key-exists? index-exists? column-exists? table-exists?)
+(declare primary-key-exists? get-primary-key foreign-key-exists? index-exists? column-exists? table-exists? get-column-constraints)
 
 (def ^:dynamic *db* nil)
 (def ^:dynamic *plan* nil)
@@ -216,29 +216,39 @@
                               (s/join  " " specs)))
                     (log/info "    * Skipping adding constraint " (log/highlight (if constraint constraint "unnamed"))
                               " because it already exists"))))
+        old-check-constraints
+        (doall (for [column drop-columns
+                     constraint (get-column-constraints *db* (to-sql-name table) (to-sql-name column))]
+                 (do (log/info "    * Removing constraint " (log/highlight constraint))
+                     constraint)))
         old-constraints
         (filter identity
-                (for [constraint drop-constraints]
-                  ;; As with drop-column, we are not checking here for add constraint followed by drop constraint
-                  ;; in the same migration.  Wouldn't make sense.
-                  (if (= constraint :primary-key)
-                    (if-let [primary-key (get-primary-key *db* (to-sql-name table :quote-for-statement false))]
-                      (do (log/info (format "   * Removing primary key %s from %s" primary-key table))
-                          (to-sql-name primary-key)) 
-                      )
-                    (if (or (not *db*)
-                            (foreign-key-exists? *db* (to-sql-name constraint)))
-                      (do
-                        (log/info "    * Removing constraint " (log/highlight constraint))
-                        (to-sql-name constraint))
-                      (log/info "   * Skipping removing constraint " (log/highlight constraint) " because it does not exist")))))
+                (doall (for [constraint drop-constraints]
+                         ;; As with drop-column, we are not checking here for add constraint followed by drop constraint
+                         ;; in the same migration.  Wouldn't make sense.
+                         (if (= constraint :primary-key)
+                           (if-let [primary-key (get-primary-key *db* (to-sql-name table :quote-for-statement false))]
+                             (do (log/info (format "   * Removing primary key %s from %s" primary-key table))
+                                 (to-sql-name primary-key)) 
+                             )
+                           (if (or (not *db*)
+                                   (foreign-key-exists? *db* (to-sql-name constraint)))
+                             (do
+                               (log/info "    * Removing constraint " (log/highlight constraint))
+                               (to-sql-name constraint))
+                             (log/info "   * Skipping removing constraint " (log/highlight constraint) " because it does not exist"))))))
         options
         (when (not-empty table-options)
           (let [opts (generate-options table-options)]
             (when (not-empty opts)
               [opts])))
         ]
-    (let [drops (s/join ", " 
+    (let [check-drops
+          (s/join ", " 
+                  (filter identity
+                          [(if (not-empty old-check-constraints )
+                             (str "constraint " (s/join "," old-check-constraints)) nil)]))
+          drops (s/join ", " 
                         (filter identity
                                 [(if (not-empty old-constraints )
                                    (str "constraint " (s/join "," old-constraints))
@@ -267,6 +277,9 @@
        (mapcat (fn [column]
                  (generate-sql {:alter-table table :modify-column column}))
                modify-columns)
+       (if (not-empty check-drops)
+         [(format "ALTER TABLE %s DROP %s" (to-sql-name table) check-drops)]
+         nil)
        (if (not-empty drops)
          [(format "ALTER TABLE %s DROP %s" (to-sql-name table) drops)]
          nil
@@ -407,10 +420,22 @@
 
 (defn- column-exists?
   [db table column]
-  (jdbc/query
-   (db-spec db)
-   ["SELECT 1 from information_schema.columns where table_catalog=? and table_name=? and column_name=?" (:database db) table column]
-   :result-set-fn first))
+  (if db
+    (jdbc/query
+     (db-spec db)
+     ["SELECT 1 from information_schema.columns where table_catalog=? and table_name=? and column_name=?" (:database db) table column]
+     :result-set-fn first)
+    false))
+
+(defn- get-column-constraints
+  [db table column]
+  (if db
+    (jdbc/query
+     (db-spec db)
+     ["select constraint_name from information_schema.constraint_column_usage where table_catalog=? and table_name=? and column_name=?"
+      (:database db) table column]
+     :row-fn :constraint_name)
+    []))
 
 (defn- create-database
   [db]
