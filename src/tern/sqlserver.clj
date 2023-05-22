@@ -476,10 +476,20 @@
     (jdbc/query
       (db-spec db)
       [(format "SELECT TOP 1 version FROM %s
-                  ORDER BY created DESC, version DESC"
+                  ORDER BY version DESC"
                version-table)]
       :row-fn :version
       :result-set-fn first)))
+
+(defn- get-versions
+  [{:keys [db version-table]}]
+  (try
+    (jdbc/query
+      (db-spec db)
+      [(format "SELECT version FROM %s
+               ORDER BY version ASC" version-table)]
+      :row-fn :version
+      )))
 
 (defn- update-schema-version
   [version-table version]
@@ -523,5 +533,7 @@
     (init-db! config))
   (version [this]
     (or (get-version config) "0"))
+  (versions [this]
+    (get-versions config))
   (migrate [this version commands]
     (run-migration! config version (validate-commands commands))))

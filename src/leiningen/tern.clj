@@ -11,6 +11,8 @@
     [#'c/init
      #'c/config
      #'c/version
+     #'c/versions
+     #'c/missing
      #'c/migrate
      #'c/rollback
      #'c/reset
@@ -36,7 +38,9 @@
               "init"          (c/init          config#)
               "config"        (c/config        config#)
               "version"       (c/version       config#)
-              "migrate"       (c/migrate       config#)
+              "versions"      (c/versions      config#)
+              "migrate"       (c/migrate       config# ~(first args))
+              "missing"       (c/missing       config#)
               "rollback"      (c/rollback      config#)
               "reset"         (c/reset         config#)
               "new-migration" (c/new-migration config# ~(first args)))))))))

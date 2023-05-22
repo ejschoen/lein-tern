@@ -5,7 +5,8 @@
             [tern.misc       :refer [last-but-one]]
             [clojure.edn     :as edn]
             [clojure.java.io :as io]
-            [clojure.string  :as s])
+            [clojure.string  :as s]
+            [clojure.set     :as set])
   (:import [java.nio.file FileSystems FileSystem Path Paths Files FileVisitOption OpenOption]
            [java.nio.file.spi FileSystemProvider]
            [java.net URI URL URLEncoder]
@@ -60,7 +61,7 @@
        (filter edn?)
        (sort-by fname)))
 
-(defn- parse-version
+(defn parse-version
   [migration]
   (s/replace (basename migration) #"-.*$" ""))
 
@@ -85,6 +86,18 @@
   "Returns migrations that have already been run."
   [config current]
   (take-while (already-run? current) (get-migrations config)))
+
+(defn missing
+  "Return migrations that are missing from the schema-versions table"
+  [impl config]
+  (let [migrations (get-migrations config)
+        version-map (reduce (fn [m migration]
+                              (assoc m (parse-version migration) migration))
+                            {}
+                            migrations)
+        db-versions (db/versions impl)]
+    (map version-map (sort (set/difference (set (keys version-map)) (set db-versions))))))
+  
 
 (defn previous-version
   "Takes a migration version as its argument and returns

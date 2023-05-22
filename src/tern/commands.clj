@@ -1,7 +1,8 @@
 (ns tern.commands
-  (:require [tern.config          :as config]
+  (:require [clojure.string       :as str]
+            [tern.config          :as config]
             [tern.db              :as db]
-            [tern.file            :as f :refer [fname]]
+            [tern.file            :as f :refer [fname basename]]
             [tern.implementations :as impl]
             [tern.log             :as log]
             [tern.migrate         :as migrate]
@@ -16,6 +17,12 @@
   "Prints the database's current version."
   [config]
   (log/info "The database is at version" (db/version (impl/factory config))))
+
+(defn versions
+  "Prints all schema migration versions recorded in the database."
+  [config]
+  (doseq [version (db/versions (impl/factory config))]
+    (log/info version)))
 
 (defn new-migration
   "Creates a new migration file using the given name.
@@ -40,26 +47,48 @@
   (log/info (log/keyword "  :password    ") (:password db))
   (log/info (log/keyword "  :subprotocol ") (:subprotocol db)))
 
-(defn migrate
-  "Runs any pending migrations to bring the database up to the latest version."
+(defn missing
+  "Prints the migrations that are missing (i.e., due to branch merging)"
   [config]
+  (doseq [version (migrate/missing (impl/factory config) config)]
+    (log/info (str version))))
+
+(defn migrate
+  "Runs any pending migrations to bring the database up to the latest version.  Optionally pass comma-separated list of versions to apply."
+  [config only-versions]
+
+  (log/info "#######################################################")
+  (log/info (format "This is tern version %s" tern-version/tern-version))
+  (log/info "#######################################################")
+  (log/info "")
+    
   (let [impl    (impl/factory config)
         from    (db/version impl)
         to      (migrate/version config)
-        pending (migrate/pending config from)]
+        missing (migrate/missing impl config)
+        version-filter (when (and (string? only-versions) (not-empty only-versions))
+                         (set (filter identity (map str/trim (str/split only-versions #"[ ,;]")))))
+        pending (if version-filter
+                  (filter (fn [p] (version-filter (migrate/parse-version (basename p)))) missing)
+                  (migrate/pending config from))]
+
+    (when version-filter
+      (log/info "#######################################################")
+      (log/info "Called with version filter" version-filter)
+      (log/info "#######################################################"))
 
     (log/info "#######################################################")
-    (log/info (format "This is tern version %s" tern-version/tern-version))
-    (log/info "#######################################################")
-    (log/info "")
-    
-    (log/info "#######################################################")
-    (log/info "Migrating from version" (log/highlight from) "to" (log/highlight to))
+    (log/info "Migrating from version"
+              (log/highlight (if version-filter (migrate/parse-version (basename (first missing))) from))
+              "to"
+              (log/highlight (if version-filter (migrate/parse-version (basename (last missing))) to)))
     (log/info "#######################################################")
     (doseq [[index ^Path migration] (map-indexed (fn [i m] [i m]) pending)]
       (log/info "Processing" (log/filename (fname migration)) (format "(%d of %d)" (inc index) (count pending)))
-      (migrate/run impl migration))
-    (if (seq pending)
+      (if (System/getenv "TERN_DRYRUN")
+        (log/info "DRY-RUN is on")
+        (migrate/run impl migration)))
+    (if (not-empty pending)
       (log/info "Migration complete")
       (log/info "There were no changes to apply"))))
 

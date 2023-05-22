@@ -14,7 +14,11 @@
   (version
     [this]
     "Return the current version of the database.")
-
+  
+  (versions
+    [this]
+    "Return all schema version numbers recorded in the database")
+  
   (migrate
     [this version commands]
     "Apply the given migration and update the schema_versions table accordingly."))
