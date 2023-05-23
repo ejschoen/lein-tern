@@ -28,6 +28,9 @@
   (version [this]
     (let [migrator (get-migrator config)]
       (version migrator)))
+  (versions [this]
+    (let [migrator (get-migrator config)]
+      (versions migrator)))
   (migrate [this version commands]
     (let [migrator (get-migrator config)]
       (migrate migrator version commands))))

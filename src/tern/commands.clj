@@ -55,7 +55,7 @@
 
 (defn migrate
   "Runs any pending migrations to bring the database up to the latest version.  Optionally pass comma-separated list of versions to apply."
-  [config only-versions]
+  [config & [only-versions]]
 
   (log/info "#######################################################")
   (log/info (format "This is tern version %s" tern-version/tern-version))

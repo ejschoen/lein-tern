@@ -331,11 +331,11 @@
   [{:keys [db version-table]}]
   (try
     (jdbc/query
-      (db-spec db)
-      [(format "SELECT version FROM %s
+     db
+     [(format "SELECT version FROM %s
                ORDER BY version ASC" version-table)]
-      :row-fn :version
-      )))
+     :row-fn :version
+     )))
 
 (defn- update-schema-version
   [version-table version]
