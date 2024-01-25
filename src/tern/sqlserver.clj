@@ -220,9 +220,9 @@
         (doall (for [column drop-columns
                      constraint (get-column-constraints *db* (to-sql-name table) (to-sql-name column))]
                  (do (log/info "    * Removing constraint " (log/highlight constraint))
-                     constraint)))
+                     (to-sql-name constraint))))
         old-constraints
-        (filter identity
+        (filter #(and % (not ((set old-check-constraints) %)))
                 (doall (for [constraint drop-constraints]
                          ;; As with drop-column, we are not checking here for add constraint followed by drop constraint
                          ;; in the same migration.  Wouldn't make sense.
@@ -247,11 +247,11 @@
           (s/join ", " 
                   (filter identity
                           [(if (not-empty old-check-constraints )
-                             (str "constraint " (s/join "," old-check-constraints)) nil)]))
+                             (str "constraint if exists " (s/join "," old-check-constraints)) nil)]))
           drops (s/join ", " 
                         (filter identity
                                 [(if (not-empty old-constraints )
-                                   (str "constraint " (s/join "," old-constraints))
+                                   (str "constraint if exists " (s/join "," old-constraints))
                                    nil
                                    ) 
                                  (if (not-empty removals)
