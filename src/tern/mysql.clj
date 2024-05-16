@@ -21,6 +21,19 @@
   (str "`" (tern.db/to-sql-name k) "`")
   )
 
+(defn from-sql-name
+  [k]
+  (if-let [[_ n] (re-matches #"`(.+)`" k)]
+    n
+    k))
+
+(defn to-sql-list
+  "Convert a list of possibly kebab cased keys into a list of snakecased strings"
+  [ks]
+  (s/join ", " (map to-sql-name ks)))
+
+
+
 (defn generate-pk
   [{:keys [primary-key] :as command}]
   (when primary-key
@@ -246,7 +259,7 @@
   [db]
   (jdbc/query
     (db-spec db "mysql")
-    ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (:database db)]
+    ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (:database (from-sql-name db))]
     :result-set-fn first))
 
 (defn- primary-key-exists?
@@ -254,7 +267,7 @@
   (if db
     (jdbc/query
      (db-spec db)
-     ["SELECT 1 from information_schema.table_constraints WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME=? AND CONSTRAINT_TYPE='PRIMARY KEY'" table]
+     ["SELECT 1 from information_schema.table_constraints WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME=? AND CONSTRAINT_TYPE='PRIMARY KEY'" (from-sql-name table)]
      :result-set-fn first)
     false))
   
@@ -263,7 +276,7 @@
   (if db
     (jdbc/query
      (db-spec db)
-     ["SELECT 1 from information_schema.table_constraints WHERE CONSTRAINT_SCHEMA=DATABASE() AND CONSTRAINT_NAME=? AND CONSTRAINT_TYPE='FOREIGN KEY'" fk]
+     ["SELECT 1 from information_schema.table_constraints WHERE CONSTRAINT_SCHEMA=DATABASE() AND CONSTRAINT_NAME=? AND CONSTRAINT_TYPE='FOREIGN KEY'" (from-sql-name fk)]
      :result-set-fn first)
     false))
 
@@ -274,7 +287,8 @@
       ;;(log/info (format "   * Testing whether table %s has index %s" table index))
       (jdbc/query
        (db-spec db)
-       ["SELECT 1 from information_schema.statistics WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?" table index]
+       ["SELECT 1 from information_schema.statistics WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?"
+        (from-sql-name table) (from-sql-name index)]
        :result-set-fn first))
     false))
 
@@ -282,14 +296,16 @@
   [db table]
   (jdbc/query
     (db-spec db)
-    ["SELECT 1 FROM information_schema.tables WHERE table_schema=database() and table_name = ?" table]
+    ["SELECT 1 FROM information_schema.tables WHERE table_schema=database() and table_name = ?" (from-sql-name table)]
     :result-set-fn first))
 
 (defn- column-exists?
   [db table column]
   (jdbc/query
    (db-spec db)
-   ["SELECT 1 from information_schema.columns where table_schema=database() and table_name=? and column_name=?" table column]
+   ["SELECT 1 from information_schema.columns where table_schema=database() and table_name=? and column_name=?"
+    (from-sql-name table)
+    (from-sql-name column)]
    :result-set-fn first))
 
 (defn- create-database
