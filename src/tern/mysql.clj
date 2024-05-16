@@ -1,5 +1,5 @@
 (ns tern.mysql
-  (:require [tern.db           :refer :all]
+  (:require [tern.db           :refer [db-spec subname Migrator]]
             [tern.log          :as log]
             [clojure.java.jdbc :as jdbc]
             [clojure.string    :as s])
@@ -15,6 +15,11 @@
        :private true}
   supported-commands
   #{:create-table :drop-table :alter-table :create-index :drop-index :insert-into :update})
+
+(defn to-sql-name
+  [k]
+  (str "`" (tern.db/to-sql-name k) "`")
+  )
 
 (defn generate-pk
   [{:keys [primary-key] :as command}]
