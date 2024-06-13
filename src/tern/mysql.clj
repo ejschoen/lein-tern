@@ -259,7 +259,7 @@
   [db]
   (jdbc/query
     (db-spec db "mysql")
-    ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (:database (from-sql-name db))]
+    ["SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?" (from-sql-name (:database db))]
     :result-set-fn first))
 
 (defn- primary-key-exists?
