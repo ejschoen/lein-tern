@@ -18,8 +18,10 @@
 
 (defn to-sql-name
   [k]
-  (str "`" (tern.db/to-sql-name k) "`")
-  )
+  (if-let [[_ name length] (re-matches #"([a-zA-Z0-9_\-]+)\((\d+)\)" k)]
+    ;; This happens when we index part of a column: foo(250)
+    (format "`%s`(%s)" (tern.db/to-sql-name name) length)
+    (str "`" (tern.db/to-sql-name k) "`")))
 
 (defn from-sql-name
   [k]
