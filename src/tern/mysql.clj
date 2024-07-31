@@ -18,9 +18,9 @@
 
 (defn to-sql-name
   [k]
-  (if-let [[_ name length] (re-matches #"([a-zA-Z0-9_\-]+)\((\d+)\)" k)]
+  (if-let [[_ col length] (re-matches #"([a-zA-Z0-9_\-]+)\((\d+)\)" (name k))]
     ;; This happens when we index part of a column: foo(250)
-    (format "`%s`(%s)" (tern.db/to-sql-name name) length)
+    (format "`%s`(%s)" (tern.db/to-sql-name col) length)
     (str "`" (tern.db/to-sql-name k) "`")))
 
 (defn from-sql-name
