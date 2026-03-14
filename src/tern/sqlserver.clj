@@ -503,18 +503,18 @@
   (try
     (binding [*db* db
               *plan* (atom [])]
-    (let [sql-commands (into [] (mapcat
-                                 (fn [command]
-                                   (let [sql (or (:sqlserver command)
-                                                 (generate-sql command))]
-                                     (swap! *plan* concat [command])
-                                     (if (string? sql) [sql] sql)))
-                                 commands))]
-      (doseq [cmd sql-commands]
-        (log/info "Executing: " (pr-str  cmd))
-        (jdbc/db-do-commands (db-spec db) cmd))
-      (log/info "Updating version to: " version)
-      (jdbc/db-do-commands (db-spec db) (update-schema-version version-table version))))))
+      (let [sql-commands (into [] (mapcat
+                                   (fn [command]
+                                     (let [sql (or (:sqlserver command)
+                                                   (generate-sql command))]
+                                       (swap! *plan* concat [command])
+                                       (if (string? sql) [sql] sql)))
+                                   commands))]
+        (doseq [cmd sql-commands]
+          (log/info "Executing: " (pr-str  cmd))
+          (jdbc/db-do-commands (db-spec db) cmd))
+        (log/info "Updating version to: " version)
+        (jdbc/db-do-commands (db-spec db) (update-schema-version version-table version))))))
 
 (defn- validate-commands
   [commands]
