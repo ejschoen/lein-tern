@@ -213,7 +213,7 @@
                          (mapcat
                           (fn [[constraint & specs]]
                             (let [spec-sql (s/join " " specs)
-                                  [_ fkcolumn pktable pkcolumn] (re-matches #"(?i)\(([\w_]+)\)\s+REFERENCES\s+([\w_]+)\(([\w_]+)\).*" spec-sql)
+                                  [_ fkcolumn pktable pkcolumn] (re-matches #"(?i)\(([\w_`]+)\)\s+REFERENCES\s+([\w_`]+)\(([\w_`]+)\).*" spec-sql)
                                   _ (if (or (nil? fkcolumn) (nil? pktable) (nil? pkcolumn))
                                       (log/error "Failed to parse constraint for" constraint ":" spec-sql))
                                   foreign-keys (get-matching-foreign-keys *db* (to-h2-name table) (to-h2-name fkcolumn)
