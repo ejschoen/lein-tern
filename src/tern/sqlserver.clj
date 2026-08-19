@@ -4,7 +4,7 @@
             [clojure.java.jdbc :as jdbc]
             [clojure.string    :as s])
   (:import [java.util Date]
-           [java.sql PreparedStatement Timestamp]))
+           [java.sql Connection PreparedStatement Statement Timestamp]))
 
 (declare primary-key-exists? get-primary-key foreign-key-exists? index-exists? column-exists? table-exists? get-column-constraints)
 
@@ -66,6 +66,7 @@
    "character set 'utf8'" ""
    "collate utf8_general_ci" ""
    "collate utf8_bin" ""
+   "default false" "default 'false'"
    "default true" "default 'true'"
    "double" "float"
    "longblob" "varbinary(max)"
@@ -496,6 +497,32 @@
   (format "INSERT INTO %s (version,created) VALUES (%s,CURRENT_TIMESTAMP)"
           version-table version))
 
+(defn- execute-statement!
+  "Execute a single SQL statement on its own connection.
+
+  Deliberately avoids `jdbc/db-do-commands`, which submits the statement with
+  `Statement.addBatch`/`executeBatch`.  The SQL Server driver reads only the
+  first result of a batch response, so for a batch holding more than one T-SQL
+  statement -- which includes anything of the form `IF <cond> <statement>` --
+  two things go wrong:
+
+    * the ENVCHANGE token announcing the transaction that SET IMPLICIT_TRANSACTIONS
+      (how the driver implements autocommit=false) opened is never read, so the
+      COMMIT that follows carries a stale transaction descriptor and the server
+      rejects it with `New request is not allowed to start because it should come
+      with valid transaction descriptor` (Msg 3989); and
+
+    * errors raised by any statement after the first are discarded, so a failed
+      migration reports success while doing nothing.
+
+  `Statement.execute` has neither problem.  Autocommit is left on: every
+  statement already ran on its own connection in its own transaction, so the
+  wrapper `db-do-commands` supplied bought nothing."
+  [db ^String sql]
+  (with-open [^Connection conn (jdbc/get-connection (db-spec db))
+              ^Statement stmt  (.createStatement conn)]
+    (.execute stmt sql)))
+
 (defn- run-migration!
   [{:keys [db version-table]} version commands]
   (when-not (vector? commands)
@@ -512,9 +539,9 @@
                                    commands))]
         (doseq [cmd sql-commands]
           (log/info "Executing: " (pr-str  cmd))
-          (jdbc/db-do-commands (db-spec db) cmd))
+          (execute-statement! db cmd))
         (log/info "Updating version to: " version)
-        (jdbc/db-do-commands (db-spec db) (update-schema-version version-table version))))))
+        (execute-statement! db (update-schema-version version-table version))))))
 
 (defn- validate-commands
   [commands]
