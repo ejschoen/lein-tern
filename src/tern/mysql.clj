@@ -225,6 +225,7 @@
   [{index :drop-index table :on}]
   ;; As with drop-column, we are not checking here for create index followed by drop index
   ;; in the same migration.  Wouldn't make sense.
+  {:pre [index table]}
   (if (or (not *db*) (index-exists? *db* (to-sql-name table) (to-sql-name index)))
     (do (log/info " - Dropping index" (log/highlight (name index)))
         [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])
@@ -379,7 +380,11 @@
       (let [sql-commands (into [] (mapcat
                                    (fn [command]
                                      (let [sql (or (:mysql command)
-                                                   (generate-sql command))]
+                                                   (try (generate-sql command)
+                                                        (catch Exception e
+                                                          (log/error "Failed to generate SQL for " (pr-str command) ": " (.getMessage e))
+                                                          (doseq [frame (.getStackTrace e)]
+                                                            (log/error (str frame))))))]
                                        (swap! *plan* concat [command])
                                        (if (string? sql) [sql] sql)))
                                    commands))]

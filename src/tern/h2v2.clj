@@ -153,40 +153,42 @@
   (log/info " - Altering table" (log/highlight (name table)))
   (let [additions
         (when (not-empty add-columns)
-          [(format "alter table %s add column (%s)"
-                   (to-h2-name table)
-                   (s/join ", "
-                           (filter identity
-                                   (for [[column & specs] add-columns]
-                                     (if (and *db*
-                                              (column-exists? *db* (to-h2-name table) (to-sql-name column))
-                                              (not (some (fn [prior]
-                                                           (and (= table (:alter-table prior))
-                                                                (some (fn [col] (= col column)) (:drop-columns prior))))
-                                                         @*plan*)))
-                                       (do (log/info (format "   * Skipping ADD COLUMN %s.%s because it already exists."
-                                                             (to-h2-name table) (to-sql-name column)))
-                                           nil)
-                                       (do (log/info "    * Adding column" (log/highlight (name column)))
-                                           (format "%s %s"
-                                                   (to-h2-name column)
-                                                   (s/join " " (remove-unsupported-column-specs specs)))))))))])
+          (let [to-add (filter identity
+                               (for [[column & specs] add-columns]
+                                 (if (and *db*
+                                          (column-exists? *db* (to-h2-name table) (to-sql-name column))
+                                          (not (some (fn [prior]
+                                                       (and (= table (:alter-table prior))
+                                                            (some (fn [col] (= col column)) (:drop-columns prior))))
+                                                     @*plan*)))
+                                   (do (log/info (format "   * Skipping ADD COLUMN %s.%s because it already exists."
+                                                         (to-h2-name table) (to-sql-name column)))
+                                       nil)
+                                   (do (log/info "    * Adding column" (log/highlight (name column)))
+                                       (format "%s %s"
+                                               (to-h2-name column)
+                                               (s/join " " (remove-unsupported-column-specs specs)))))))]
+            (when (not-empty to-add)
+              [(format "alter table %s add column (%s)"
+                       (to-h2-name table)
+                       (s/join ", " to-add))])))
         removals (when (not-empty drop-columns)
-                   [(format "alter table %s drop column %s"
-                         (to-h2-name table)
-                         (s/join ", "
-                                 (filter identity
-                                         (for [column drop-columns]
-                                           ;; Note: No test for prior alter table/add column or create table w/ column
-                                           ;; because frankly it would not make sense in a single migration to create
-                                           ;; a table column and then immediately drop it.
-                                           (if (or (not *db*)
-                                                   (column-exists? *db* (to-h2-name table) (to-sql-name column)))
-                                             (do (log/info "    * Dropping column" (log/highlight (name column)))
-                                                 (format "%s" (to-h2-name column)))
-                                             (do (log/info "   * Skipping DROP COLUMN %s.%s because that column does not exist."
-                                                           (to-h2-name table) (to-h2-name column))
-                                                 nil))))))])
+                   (let [to-remove (filter identity
+                                           (for [column drop-columns]
+                                             ;; Note: No test for prior alter table/add column or create table w/ column
+                                             ;; because frankly it would not make sense in a single migration to create
+                                             ;; a table column and then immediately drop it.
+                                             (if (or (not *db*)
+                                                     (column-exists? *db* (to-h2-name table) (to-sql-name column)))
+                                               (do (log/info "    * Dropping column" (log/highlight (name column)))
+                                                   (format "%s" (to-h2-name column)))
+                                               (do (log/info "   * Skipping DROP COLUMN %s.%s because that column does not exist."
+                                                             (to-h2-name table) (to-h2-name column))
+                                                   nil))))]
+                     (when (not-empty to-remove)
+                       [(format "alter table %s drop column %s"
+                                (to-h2-name table)
+                                (s/join ", " to-remove))])))
         modifications (filter identity (for [[column & specs] modify-columns]
                                          (do (log/info "    * Modifying column" (log/highlight (name column)))
                                              (format "ALTER TABLE %s ALTER COLUMN %s %s"
