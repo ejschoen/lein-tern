@@ -498,7 +498,7 @@
           version-table version))
 
 (defn- execute-statement!
-  "Execute a single SQL statement on its own connection.
+  "Execute a single SQL statement on the supplied connection.
 
   Deliberately avoids `jdbc/db-do-commands`, which submits the statement with
   `Statement.addBatch`/`executeBatch`.  The SQL Server driver reads only the
@@ -515,12 +515,11 @@
     * errors raised by any statement after the first are discarded, so a failed
       migration reports success while doing nothing.
 
-  `Statement.execute` has neither problem.  Autocommit is left on: every
-  statement already ran on its own connection in its own transaction, so the
-  wrapper `db-do-commands` supplied bought nothing."
-  [db ^String sql]
-  (with-open [^Connection conn (jdbc/get-connection (db-spec db))
-              ^Statement stmt  (.createStatement conn)]
+  `Statement.execute` has neither problem.  Autocommit is left on: SQL Server
+  autocommits DDL anyway, and the per-statement transaction `db-do-commands`
+  opened is exactly what provoked Msg 3989."
+  [^Connection conn ^String sql]
+  (with-open [^Statement stmt (.createStatement conn)]
     (.execute stmt sql)))
 
 (defn- run-migration!
@@ -535,13 +534,19 @@
                                      (let [sql (or (:sqlserver command)
                                                    (generate-sql command))]
                                        (swap! *plan* concat [command])
-                                       (if (string? sql) [sql] sql)))
+                                       (sql-statements sql {:version version
+                                                            :command command})))
                                    commands))]
-        (doseq [cmd sql-commands]
-          (log/info "Executing: " (pr-str  cmd))
-          (execute-statement! db cmd))
-        (log/info "Updating version to: " version)
-        (execute-statement! db (update-schema-version version-table version))))))
+        ;; One connection for the whole migration.  Session-scoped state --
+        ;; `SET IDENTITY_INSERT` most notably -- has to survive from one
+        ;; statement to the next, which it cannot do when each statement logs
+        ;; in on a connection of its own.
+        (with-open [^Connection conn (jdbc/get-connection (db-spec db))]
+          (doseq [cmd sql-commands]
+            (log/info "Executing: " (pr-str  cmd))
+            (execute-statement! conn cmd))
+          (log/info "Updating version to: " version)
+          (execute-statement! conn (update-schema-version version-table version)))))))
 
 (defn- validate-commands
   [commands]

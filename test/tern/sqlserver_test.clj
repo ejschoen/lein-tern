@@ -39,3 +39,13 @@
                        :table-options [{:name "ROW_FORMAT" :value "Compressed"}]
                        :columns [[:a "INT"] [:b "INT"]]}))
 
+
+;; A malformed override is rejected before any statement runs, so the migration
+;; aborts rather than being recorded as applied.  Normalization itself lives in
+;; `tern.db/sql-statements` and is exercised in `tern.db-test`.
+(expect clojure.lang.ExceptionInfo
+        (#'tern.sqlserver/run-migration!
+          {:db {:subprotocol "sqlserver" :subname "//localhost/unused"}
+           :version-table "schema_versions"}
+          "20260820000000"
+          [{:sqlserver [42]}]))

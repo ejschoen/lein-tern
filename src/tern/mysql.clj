@@ -1,5 +1,5 @@
 (ns tern.mysql
-  (:require [tern.db           :refer [db-spec subname Migrator]]
+  (:require [tern.db           :refer [db-spec subname sql-statements Migrator]]
             [tern.log          :as log]
             [clojure.java.jdbc :as jdbc]
             [clojure.string    :as s])
@@ -380,13 +380,19 @@
       (let [sql-commands (into [] (mapcat
                                    (fn [command]
                                      (let [sql (or (:mysql command)
+                                                   ;; Log the failure in full, then rethrow.  Swallowing it
+                                                   ;; left `sql` nil, which contributed no SQL to the batch
+                                                   ;; while the version row was still written -- the
+                                                   ;; migration was recorded as applied without having run.
                                                    (try (generate-sql command)
                                                         (catch Exception e
                                                           (log/error "Failed to generate SQL for " (pr-str command) ": " (.getMessage e))
                                                           (doseq [frame (.getStackTrace e)]
-                                                            (log/error (str frame))))))]
+                                                            (log/error (str frame)))
+                                                          (throw e))))]
                                        (swap! *plan* concat [command])
-                                       (if (string? sql) [sql] sql)))
+                                       (sql-statements sql {:version version
+                                                            :command command})))
                                    commands))]
         (doseq [cmd sql-commands]
           (log/info "Executing: " (pr-str  cmd))
