@@ -47,5 +47,6 @@
         (#'tern.sqlserver/run-migration!
           {:db {:subprotocol "sqlserver" :subname "//localhost/unused"}
            :version-table "schema_versions"}
+          nil
           "20260820000000"
           [{:sqlserver [42]}]))

@@ -56,6 +56,7 @@
                       tern.log/error (fn [& _] nil)]
           (run-migration! {:db {:subprotocol "mysql" :subname "//localhost/unused"}
                            :version-table "schema_versions"}
+                          nil
                           "20260820000000"
                           [{:create-table :foo}])))
 
@@ -65,5 +66,6 @@
 (expect clojure.lang.ExceptionInfo
         (run-migration! {:db {:subprotocol "mysql" :subname "//localhost/unused"}
                          :version-table "schema_versions"}
+                        nil
                         "20260820000000"
                         [{:mysql [42]}]))

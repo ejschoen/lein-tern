@@ -338,12 +338,17 @@
      )))
 
 (defn- update-schema-version
-  [version-table version]
-  (format "INSERT INTO %s (version,created) VALUES (%s,CURRENT_TIMESTAMP)"
-          version-table version))
+  "SQL recording the outcome of a migration in the version table: an insert of
+  the version just applied, or -- when `from` is given, meaning that version was
+  rolled back down to `version` -- a delete of the rolled-back version's row."
+  [version-table from version]
+  (if from
+    (delete-schema-version version-table from)
+    (format "INSERT INTO %s (version,created) VALUES (%s,CURRENT_TIMESTAMP)"
+            version-table version)))
 
 (defn- run-migration!
-  [{:keys [db version-table]} version commands]
+  [{:keys [db version-table]} from version commands]
   (when-not (vector? commands)
     (log/error "Values for `up` and `down` must be vectors of commands"))
   (binding [*db* db
@@ -360,8 +365,10 @@
              (catch Exception e
                (log/error "Error executing SQL command" cmd (.getMessage e))
                (throw e))))
-      (log/info "Updating version to: " version)
-      (jdbc/db-do-commands db (update-schema-version version-table version)))))
+      (if from
+        (log/info "Rolled back version" from "- database is now at version" version)
+        (log/info "Updating version to: " version))
+      (jdbc/db-do-commands db (update-schema-version version-table from version)))))
 
 (defn- validate-commands
   [commands]
@@ -383,4 +390,6 @@
   (versions [this]
     (get-versions config))
   (migrate [this version commands]
-    (run-migration! config version (validate-commands commands))))
+    (run-migration! config nil version (validate-commands commands)))
+  (migrate [this from version commands]
+    (run-migration! config from version (validate-commands commands))))

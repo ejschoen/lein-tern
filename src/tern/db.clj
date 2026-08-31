@@ -21,7 +21,16 @@
   
   (migrate
     [this version commands]
-    "Apply the given migration and update the schema_versions table accordingly."))
+    [this from version commands]
+    "Apply the given migration and update the schema_versions table accordingly.
+
+    `from` names the version the database is moving away from.  It is nil for a
+    forward migration -- the three-argument arity -- which records `version`,
+    the migration just applied, in the version table.  For a rollback, `from` is
+    the version being rolled back and `version` the version being rolled back
+    to, and the row for `from` is deleted instead of a row for `version` being
+    inserted: a migration that has been rolled back is no longer applied, so it
+    must no longer be recorded as applied."))
 
 (defn subname
   "Build the db subname from its component parts"
@@ -79,3 +88,18 @@
                           "of strings, but got " (pr-str sql)
                           (when command (str " from command " (pr-str command))))
                      {:version version :command command :sql sql})))))
+
+(defn delete-schema-version
+  "SQL to remove a rolled-back migration's row from the version table.
+
+  Rollback ran a migration's `down` commands and then handed the version table
+  the version it had rolled back *to*, which was inserted as though it were a
+  newly applied migration.  The rolled-back version's own row was never removed,
+  so the database went on reporting itself at that version: `pending` skipped
+  the migration on the way back up, and a duplicate row accumulated for the
+  version below it.  Deleting the row is what makes the rollback visible.
+
+  The version column is a VARCHAR, so the literal is quoted -- PostgreSQL will
+  not compare a character column against a bare numeric literal."
+  [version-table version]
+  (format "DELETE FROM %s WHERE version = '%s'" version-table version))

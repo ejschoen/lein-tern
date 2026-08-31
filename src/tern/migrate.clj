@@ -129,11 +129,18 @@
 (defn rollback
   "Roll back the given migration. Uses the same code as applying a migration,
   but simply passes the `down` commands and the version of the migration that's
-  being rolled back to."
+  being rolled back to.
+
+  The migration's own version is passed as `from` so that its row can be deleted
+  from the version table.  Without it the rollback recorded nothing: the version
+  it rolled back to was inserted a second time and the rolled-back version's row
+  was left in place, so the database still reported itself at the version it had
+  just undone."
   [impl ^Path migration version]
-  (let [commands (with-open [s (path->stream ^Path migration)]
+  (let [from     (parse-version migration)
+        commands (with-open [s (path->stream ^Path migration)]
                    (-> s slurp edn/read-string :down))]
-        (db/migrate impl version commands)))
+    (db/migrate impl from version commands)))
 
 (defn reset
   "Roll back ALL migrations."

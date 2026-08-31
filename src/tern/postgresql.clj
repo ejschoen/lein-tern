@@ -160,18 +160,23 @@
       )))
 
 (defn- update-schema-version
-  [version-table version]
-  (format "INSERT INTO %s (version) VALUES (%s)" version-table version))
+  "SQL recording the outcome of a migration in the version table: an insert of
+  the version just applied, or -- when `from` is given, meaning that version was
+  rolled back down to `version` -- a delete of the rolled-back version's row."
+  [version-table from version]
+  (if from
+    (delete-schema-version version-table from)
+    (format "INSERT INTO %s (version) VALUES (%s)" version-table version)))
 
 (defn- run-migration!
-  [{:keys [db version-table]} version commands]
+  [{:keys [db version-table]} from version commands]
   (when-not (vector? commands)
     (log/error "Values for `up` and `down` must be vectors of commands"))
   (try
     (apply jdbc/db-do-commands
            (db-spec db)
            (conj (into [] (mapcat generate-sql commands))
-                 (update-schema-version version-table version)))
+                 (update-schema-version version-table from version)))
     (catch PSQLException e
       (log/error "Migration failed:" (psql-error-message e))
       (log/error e)
@@ -201,4 +206,6 @@
   (versions [this]
     (get-versions config))
   (migrate [this version commands]
-    (run-migration! config version (validate-commands commands))))
+    (run-migration! config nil version (validate-commands commands)))
+  (migrate [this from version commands]
+    (run-migration! config from version (validate-commands commands))))

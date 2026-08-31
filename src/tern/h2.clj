@@ -33,4 +33,7 @@
       (versions migrator)))
   (migrate [this version commands]
     (let [migrator (get-migrator config)]
-      (migrate migrator version commands))))
+      (migrate migrator version commands)))
+  (migrate [this from version commands]
+    (let [migrator (get-migrator config)]
+      (migrate migrator from version commands))))
