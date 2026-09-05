@@ -408,7 +408,7 @@
       ;;(log/info (format "   * Testing whether table %s has index %s" table index))
       (jdbc/query
        (db-spec db)
-       ["SELECT 1 where indexproperty(object_id(?),?,'IndexID') is not null" (str (:database- db) "." table) index]
+       ["SELECT 1 where indexproperty(object_id(?),?,'IndexID') is not null" (str (:database db) "." table) index]
        :result-set-fn first))
     false))
 
