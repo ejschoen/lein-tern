@@ -1,4 +1,4 @@
-(defproject cc.artifice/lein-tern "0.10.17"
+(defproject cc.artifice/lein-tern "0.10.18-SNAPSHOT"
   :description "Migrations as data"
   :url "http://github.com/artifice-cc/lein-tern"
   :license {:name "MIT"
@@ -11,7 +11,9 @@
                  [postgresql "9.3-1102.jdbc41"]
                  [org.xerial/sqlite-jdbc "3.46.0.0"]
                  [java-jdbc/dsl "0.1.3"]]
-  :profiles {:dev {:dependencies [[expectations "2.1.4"]]
+  :profiles {:dev {:dependencies [[expectations "2.1.4"]
+                                  ;; test-only: the live SQL Server guard test
+                                  [com.microsoft.sqlserver/mssql-jdbc "12.10.2.jre11"]]
                    :plugins [[lein-autoexpect "1.7.0"]
                              [lein-expectations "0.0.8"]]}}
   :eval-in-leiningen true)

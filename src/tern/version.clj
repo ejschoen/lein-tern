@@ -1,3 +1,3 @@
 (ns tern.version)
-(def tern-version "0.10.17")
+(def tern-version "0.10.18-SNAPSHOT")
 

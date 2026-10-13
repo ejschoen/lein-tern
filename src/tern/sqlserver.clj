@@ -406,9 +406,12 @@
   (if db
     (do 
       ;;(log/info (format "   * Testing whether table %s has index %s" table index))
+      ;; OBJECT_ID('[database_name.[schema_name].|schema_name.]object_name'): a two-part
+      ;; "database.table" is read as schema.table and resolves to NULL, so every index looked
+      ;; absent.  "database..table" names the database and leaves the schema to the caller's default.
       (jdbc/query
        (db-spec db)
-       ["SELECT 1 where indexproperty(object_id(?),?,'IndexID') is not null" (str (:database db) "." table) index]
+       ["SELECT 1 where indexproperty(object_id(?),?,'IndexID') is not null" (str (:database db) ".." table) index]
        :result-set-fn first))
     false))
 
