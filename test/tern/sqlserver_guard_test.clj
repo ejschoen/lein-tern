@@ -100,11 +100,11 @@
 (def ^:private xom-indexes  {["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx"]})
 (def ^:private xom-defaults {["pending_updates" "lease_owner"] ["DF_pending_updates_lease_owner"]})
 
-;; XOM's failure without its :drop-index: the index goes first, dropped only if it still
-;; contains the column when the statement runs (the exact predicate text, for this table,
-;; index and column), then the default and the columns together, in one ALTER TABLE that
-;; SQL Server applies whole or not at all.
-(expect ["IF EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = 'pending_updates' AND i.name = 'pending_updates_lease_idx' AND c.name = 'lease_expires_at') DROP INDEX pending_updates_lease_idx ON pending_updates"
+;; XOM's failure without its :drop-index: the index goes first, dropped only if, when the
+;; statement runs, it still contains one of the columns the command drops (the exact
+;; predicate text for this table, index and the two columns), then the default and the
+;; columns together, in one ALTER TABLE that SQL Server applies whole or not at all.
+(expect ["IF EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = 'pending_updates' AND i.name = 'pending_updates_lease_idx' AND c.name IN ('lease_owner', 'lease_expires_at')) DROP INDEX [pending_updates_lease_idx] ON pending_updates"
          "ALTER TABLE pending_updates DROP constraint if exists DF_pending_updates_lease_owner, column lease_owner,lease_expires_at"]
         (:sql (migrate-with-dependents [] xom-indexes xom-defaults [(dropping :pending_updates :lease_owner :lease_expires_at)])))
 
@@ -113,19 +113,29 @@
         (:sql (migrate-with-dependents [] {} {} [(dropping :pending_updates :lease_owner :lease_expires_at)])))
 
 (defn- if-holds
-  "The statement expected for `index` holding `column` on `table` (catalog names;
-  `on` is the table as the DROP names it, `table` unless given)."
-  ([table index column] (if-holds table index column table))
-  ([table index column on]
+  "The statement expected for `index` on `table` when the command drops `columns`
+  (catalog names, quote-free; `on` is the table as the DROP names it, `table`
+  unless given)."
+  ([table index columns] (if-holds table index columns table))
+  ([table index columns on]
    (str "IF EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id"
         " JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id"
-        " WHERE o.name = '" table "' AND i.name = '" index "' AND c.name = '" column "')"
-        " DROP INDEX " index " ON " on)))
+        " WHERE o.name = '" table "' AND i.name = '" index "' AND c.name IN ("
+        (clojure.string/join ", " (map #(str "'" % "'") columns)) "))"
+        " DROP INDEX [" index "] ON " on)))
 
-;; The predicate's names are T-SQL literals: a single quote in a name is doubled there,
-;; while the DROP names the index as to-sql-name gives it.
-(expect "IF EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = 'pending_updates' AND i.name = 'ix''q' AND c.name = 'state') DROP INDEX ix'q ON pending_updates"
-        (#'sqlserver/drop-index-if-it-holds :pending_updates "ix'q" "state"))
+(def ^:private stmt-prefix
+  "IF EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = 'pending_updates' AND ")
+
+;; Names that need quoting: in the predicate a T-SQL literal doubles a single quote; in the
+;; DROP the index is always bracketed, a ] doubled inside (as QUOTENAME does; a [ needs no
+;; escape), so a quote, a bracket or a space in the name is valid T-SQL.
+(expect [(str stmt-prefix "i.name = 'ix''q' AND c.name IN ('state', 'o''k')) DROP INDEX [ix'q] ON pending_updates")
+         (str stmt-prefix "i.name = 'ix]b' AND c.name IN ('state')) DROP INDEX [ix]]b] ON pending_updates")
+         (str stmt-prefix "i.name = 'IX sp' AND c.name IN ('state')) DROP INDEX [IX sp] ON pending_updates")]
+        [(#'sqlserver/drop-index-if-it-holds :pending_updates "ix'q" ["state" "o'k"])
+         (#'sqlserver/drop-index-if-it-holds :pending_updates "ix]b" ["state"])
+         (#'sqlserver/drop-index-if-it-holds :pending_updates "IX sp" ["state"])])
 
 (def ^:private expected-indexes-sql
   "SELECT i.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = ? AND c.name = ? AND i.name IS NOT NULL AND i.is_primary_key = 0 AND i.is_unique_constraint = 0")
@@ -181,8 +191,8 @@
   {["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx" "pending_updates_other_idx"]})
 
 (def ^:private after-planned-drop
-  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" "lease_expires_at")
-           (if-holds "pending_updates" "pending_updates_other_idx" "lease_expires_at")
+  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_expires_at"])
+           (if-holds "pending_updates" "pending_updates_other_idx" ["lease_expires_at"])
            "ALTER TABLE pending_updates DROP column lease_expires_at"]
    :added [{:drop-index :pending_updates_other_idx :on :pending_updates}]})
 
@@ -196,7 +206,7 @@
 
 (def ^:private with-own-drop-index
   {:sql   ["drop index if exists pending_updates_lease_idx on pending_updates"
-           (if-holds "pending_updates" "pending_updates_other_idx" "lease_expires_at")
+           (if-holds "pending_updates" "pending_updates_other_idx" ["lease_expires_at"])
            "ALTER TABLE pending_updates DROP column lease_expires_at"]
    :added [{:drop-index :pending_updates_other_idx :on :pending_updates}]})
 
@@ -208,7 +218,7 @@
                                          :drop-index [:pending_updates_lease_idx])]))
 
 (def ^:private drop-then-create
-  [(if-holds "pending_updates" "pending_updates_lease_idx" "lease_expires_at")
+  [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_expires_at"])
    "ALTER TABLE pending_updates DROP column lease_expires_at"
    "CREATE  INDEX pending_updates_lease_idx ON pending_updates (state)"])
 
@@ -225,7 +235,7 @@
    {:create-index :pending_updates_lease_idx :on :pending_updates :columns [:state]}])
 
 (def ^:private conditional-drop-only
-  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" "lease_expires_at")
+  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_expires_at"])
            "ALTER TABLE pending_updates DROP column lease_expires_at"]
    :added []})
 
@@ -236,7 +246,7 @@
         (migrate-with-dependents redefining-plan xom-indexes {} [(dropping :pending_updates :lease_expires_at)]))
 
 (def ^:private conditional-drop-added
-  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" "lease_expires_at")
+  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_expires_at"])
            "ALTER TABLE pending_updates DROP column lease_expires_at"]
    :added [{:drop-index :pending_updates_lease_idx :on :pending_updates}]})
 
@@ -252,24 +262,35 @@
    ["pending_updates" "leased_at"]        ["pending_updates_lease_idx"]})
 
 (def ^:private shared-index-twice
-  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" "lease_owner")
+  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_owner" "lease_expires_at"])
            "ALTER TABLE pending_updates DROP column lease_owner,lease_expires_at"
-           (if-holds "pending_updates" "pending_updates_lease_idx" "leased_at")
+           (if-holds "pending_updates" "pending_updates_lease_idx" ["leased_at"])
            "ALTER TABLE pending_updates DROP column leased_at"]
    :added [{:drop-index :pending_updates_lease_idx :on :pending_updates}]})
 
-;; An index on several dropped columns: one statement per command, its predicate on the
-;; command's first dropped column, and one plan entry for the whole migration.
+;; An index on several dropped columns: one statement per command, its predicate on every
+;; column that command drops, and one plan entry for the whole migration.
 (expect shared-index-twice
         (migrate-with-dependents [] shared-index {}
                                  [(dropping :pending_updates :lease_owner :lease_expires_at)
                                   (dropping :pending_updates :leased_at)]))
 
 (def ^:private reserved-table
-  [(if-holds "user" "user_x_idx" "name" "[user]")
+  [(if-holds "user" "user_x_idx" ["name"] "[user]")
    "ALTER TABLE [user] DROP column name"])
 
 ;; In the DROP a reserved-word table keeps the brackets to-sql-name gives it; in the
 ;; predicate it is the catalog name.
 (expect reserved-table
         (:sql (migrate-with-dependents [] {["user" "name"] ["user_x_idx"]} {} [(dropping :user :name)])))
+
+(def ^:private recreated-on-second
+  [(if-holds "t" "x_idx" ["a" "b"])
+   "ALTER TABLE t DROP column a,b"])
+
+;; The predicate lists every column the command drops, not only the one the catalog showed
+;; in the index when the SQL was generated: x_idx holds only a then, and if the migration
+;; re-creates it on b before this statement runs, it still holds a dropped column and is
+;; dropped, so the column drop does not meet 5074.
+(expect recreated-on-second
+        (:sql (migrate-with-dependents [] {["t" "a"] ["x_idx"]} {} [(dropping :t :a :b)])))

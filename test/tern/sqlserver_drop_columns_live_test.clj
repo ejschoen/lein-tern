@@ -19,11 +19,12 @@
   `*plan*` to an empty plan, runs `generate-sql` for `:drop-columns [:a :b]`,
   executes every statement in order, and reads the catalog: a, b, the three
   indexes and the default must be gone, the table and its column id still
-  there.  It prints one DROP-COLUMNS-LIVE line.  A second table, the same with
-  the suffix _r, runs the same way except that between tern generating its
-  statements and their execution the test re-creates _a2_idx on (id) alone:
-  tern's statement for that index must then leave it, and the line is
-  DROP-COLUMNS-LIVE-REDEFINED.  A table is kept (the line ends table-kept)
+  there.  tern's statements run through tern's own executor
+  (execute-statement!, Statement.execute).  It prints one DROP-COLUMNS-LIVE
+  line.  A second table, the same with the suffix _r, runs the same way except
+  that between tern generating its statements and their execution the test
+  re-creates _a2_idx on (id) alone and _a_idx on (b): tern's statements must
+  leave _a2_idx and drop _a_idx, and the line is DROP-COLUMNS-LIVE-REDEFINED.  A table is kept (the line ends table-kept)
   unless TERN_SCRATCH_DROP_TABLE is true and every check on it passed; then the
   test drops that table (table-dropped).  It never
   creates or drops a database.  Nothing it prints carries the login or the
@@ -143,8 +144,9 @@
   "Creates the table with its four dependents in the scratch database, has tern
   drop the two columns, executes its statements in order, and reads the catalog.
   With `redefined?`, between tern generating its statements and their execution
-  it drops _a2_idx and re-creates it on (id) alone, as a migration could, so the
-  run-time condition of tern's statement for that index must leave it alone.
+  it re-creates _a2_idx on (id) alone and _a_idx on (b), as a migration could:
+  the run-time condition of tern's statements must leave _a2_idx, which holds no
+  dropped column, and drop _a_idx, which holds b.
   Never throws: a failure is returned under :error, scrubbed, naming the step."
   [db redefined?]
   (let [table  (str "tern_dc_" (.format (DateTimeFormatter/ofPattern "yyyyMMddHHmmss")
@@ -175,15 +177,19 @@
                                                                 :drop-columns [:a :b]}))))]
           (swap! result assoc :statements (count statements))
           (when redefined?
-            (reset! step "re-creating _a2_idx on (id)")
+            (reset! step "re-creating _a2_idx on (id) and _a_idx on (b)")
             (doseq [sql [(format "DROP INDEX %s_a2_idx ON %s" table table)
-                         (format "CREATE INDEX %s_a2_idx ON %s (id)" table table)]]
+                         (format "CREATE INDEX %s_a2_idx ON %s (id)" table table)
+                         (format "DROP INDEX %s_a_idx ON %s" table table)
+                         (format "CREATE INDEX %s_a_idx ON %s (b)" table table)]]
               (println (str label "before tern's statements: " sql))
               (jdbc/execute! conn [sql] :transaction? false)))
+          ;; tern's statements go through tern's own executor, Statement.execute on the
+          ;; connection, as run-migration! sends them.
           (doseq [[i sql] (map-indexed vector statements)]
             (println (str label "statement " (inc i) " of " (count statements) ": " sql))
             (reset! step (str "statement " (inc i) " of " (count statements)))
-            (jdbc/execute! conn [sql] :transaction? false)))
+            (#'sqlserver/execute-statement! (jdbc/db-connection conn) sql)))
         (reset! step "reading the catalog after")
         (swap! result assoc :after (cond-> (dependents conn table)
                                      redefined? (assoc :a2-columns (index-columns conn table (str table "_a2_idx")))))
@@ -247,8 +253,9 @@
               (:tables (:after result)))
 
       ;; The redefined scenario: the same dependents before, no error, and afterwards a and
-      ;; b, _a_idx, _id_b_idx and the default gone while _a2_idx, re-created on (id) between
-      ;; generation and execution, survives with that definition.
+      ;; b, _id_b_idx, the default and _a_idx (re-created on b, a dropped column) gone while
+      ;; _a2_idx, re-created on (id) between generation and execution, survives with that
+      ;; definition.
       (expect (expected-before (:table redefined))
               (before-summary redefined))
 

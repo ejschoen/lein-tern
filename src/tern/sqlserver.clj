@@ -162,32 +162,29 @@
   [s]
   (str "'" (s/replace (str s) "'" "''") "'"))
 
+(defn- bracketed
+  "`s` as a T-SQL bracket-delimited identifier, as QUOTENAME makes one: [s] with
+  each ] doubled (a [ inside needs no escape)."
+  [s]
+  (str "[" (s/replace (str s) "]" "]]") "]"))
+
 (defn- drop-index-if-it-holds
   "One statement that drops `index` from `table` only if, when it runs, the index
-  still contains `column`: the catalog is read at execution time, so an index the
-  migration has meanwhile dropped, or redefined without the column (by
-  :create-index, raw SQL or an override), is left alone.  `index` and `column`
-  are catalog names; the predicate carries catalog names as literals, the DROP
-  the to-sql-name forms."
-  [table index column]
+  still contains one of `columns`, the columns the command drops: the catalog is
+  read at execution time, so an index the migration has meanwhile dropped, or
+  redefined without those columns (by :create-index, raw SQL or an override), is
+  left alone, and one redefined to hold any of them is dropped.  `index` and
+  `columns` are catalog names; the predicate carries them as literals, the DROP
+  the index bracketed and the table as to-sql-name gives it."
+  [table index columns]
   (format (str "IF EXISTS (SELECT 1 FROM sys.indexes i"
                " JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id"
                " JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id"
                " JOIN sys.objects o ON o.object_id = i.object_id"
-               " WHERE o.name = %s AND i.name = %s AND c.name = %s)"
+               " WHERE o.name = %s AND i.name = %s AND c.name IN (%s))"
                " DROP INDEX %s ON %s")
-          (sql-literal (catalog-name table)) (sql-literal index) (sql-literal column)
-          (to-sql-name index) (to-sql-name table)))
-
-(defn- first-pair-per-index
-  "The first [index column] pair for each index, in order."
-  [pairs]
-  (:out (reduce (fn [{:keys [seen] :as acc} [index :as pair]]
-                  (if (seen index)
-                    acc
-                    (-> acc (update :seen conj index) (update :out conj pair))))
-                {:seen #{} :out []}
-                pairs)))
+          (sql-literal (catalog-name table)) (sql-literal index) (s/join ", " (map sql-literal columns))
+          (bracketed index) (to-sql-name table)))
 
 (defmethod generate-sql
   :alter-table
@@ -265,27 +262,26 @@
         ;; SQL Server refuses to drop a column that an index or a default constraint
         ;; depends on (error 5074).  Every index the catalog shows on a dropped column
         ;; gets one statement that drops it only if, when the statement runs, it still
-        ;; contains the column (drop-index-if-it-holds): the plan cannot say what
-        ;; earlier statements did (a :drop-index whose guard missed, an index re-created
-        ;; by :create-index, raw SQL or an override), the catalog at execution time can.
-        ;; An index on several dropped columns gets one statement, on the first of them.
-        ;; Only this command's own :drop-index key, which is emitted unconditionally,
-        ;; makes the statement redundant.  Each index found here is added to the plan as
+        ;; contains one of the columns this command drops (drop-index-if-it-holds): the
+        ;; plan cannot say what earlier statements did (a :drop-index whose guard
+        ;; missed, an index re-created by :create-index, raw SQL or an override), the
+        ;; catalog at execution time can.  Only this command's own :drop-index key,
+        ;; which is emitted unconditionally, makes the statement redundant.  Each index found here is added to the plan as
         ;; a :drop-index, unless the plan already holds that entry, so a later
         ;; :create-index of the same name is emitted rather than skipped by its guard,
         ;; which reads the catalog before anything executes and would still find it.
         dependent-indexes
         (let [own-drops (set (map catalog-name drop-indices))]
-          (doall (for [[index column] (first-pair-per-index
-                                       (for [column removed-columns
-                                             index (get-column-indexes *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
-                                         [index (to-sql-name column :quote-for-statement false)]))
+          (doall (for [index (distinct
+                              (for [column removed-columns
+                                    index (get-column-indexes *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
+                                index))
                        :when (not (own-drops (catalog-name index)))]
                    (let [entry {:drop-index (keyword index) :on table}]
-                     (log/info "    * Removing index" (log/highlight index) "if it still contains" (log/highlight column))
+                     (log/info "    * Removing index" (log/highlight index) "if it still contains a dropped column")
                      (when (and *plan* (not (some #{entry} @*plan*)))
                        (swap! *plan* concat [entry]))
-                     [index column]))))
+                     index))))
         ;; A default constraint (sys.default_constraints: information_schema does not list
         ;; defaults) is dropped in the same ALTER TABLE statement as its column, which SQL
         ;; Server applies whole or not at all: a column drop that still fails leaves the
@@ -351,8 +347,9 @@
                                                                        (to-sql-name idx)
                                                                        (to-sql-name table)))
                                                              drop-indices)))])
-       (for [[index column] dependent-indexes]
-         (drop-index-if-it-holds table index column))
+       (let [columns (map #(to-sql-name % :quote-for-statement false) removed-columns)]
+         (for [index dependent-indexes]
+           (drop-index-if-it-holds table index columns)))
        (mapcat (fn [column]
                  (generate-sql {:alter-table table :modify-column column}))
                modify-columns)
