@@ -202,6 +202,31 @@
                                        [(dropping :pending_updates :lease_expires_at)
                                         {:create-index :pending_updates_lease_idx :on :pending_updates :columns [:state]}])))
 
+(def ^:private redefining-plan
+  [{:drop-index :pending_updates_lease_idx :on :pending_updates}
+   {:create-index :pending_updates_lease_idx :on :pending_updates :columns [:state]}])
+
+(def ^:private column-drop-only
+  {:sql   ["ALTER TABLE pending_updates DROP column lease_expires_at"]
+   :added []})
+
+;; A plan that drops the index and then creates it again has redefined it: the catalog's
+;; old definition is gone by the time the column drop runs, so the index is left alone
+;; (no drop, no plan entry).  A new definition that still uses the column fails with 5074.
+(expect column-drop-only
+        (migrate-with-dependents redefining-plan xom-indexes {} [(dropping :pending_updates :lease_expires_at)]))
+
+(def ^:private dependent-after-create
+  {:sql   ["drop index if exists pending_updates_lease_idx on pending_updates"
+           "ALTER TABLE pending_updates DROP column lease_expires_at"]
+   :added [{:drop-index :pending_updates_lease_idx :on :pending_updates}]})
+
+;; A :create-index alone (its guard skips it while the index exists) redefines nothing:
+;; the dependent drop is emitted and added to the plan as before.
+(expect dependent-after-create
+        (migrate-with-dependents [{:create-index :pending_updates_lease_idx :on :pending_updates :columns [:state]}]
+                                 xom-indexes {} [(dropping :pending_updates :lease_expires_at)]))
+
 (def ^:private shared-index
   {["pending_updates" "lease_owner"]      ["pending_updates_lease_idx"]
    ["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx"]

@@ -157,6 +157,29 @@
   [k]
   (to-sql-name k :quote-for-statement false))
 
+(defn- plan-redefined-indexes
+  "The [table index] pairs, as catalog names, that `plan` redefines: a drop of
+  the index, `{:drop-index i :on t}` or an `:alter-table t` whose `:drop-index`
+  key names `i`, followed later by `{:create-index i :on t}`.  Values that are
+  not names are ignored."
+  [plan]
+  (let [named? (fn [x] (or (keyword? x) (string? x) (symbol? x)))]
+    (:redefined
+     (reduce (fn [{:keys [dropped] :as acc} command]
+               (let [index   (:drop-index command)
+                     drops   (cond (nil? index)           nil
+                                   (:alter-table command) (for [i (if (sequential? index) index [index])]
+                                                            [(:alter-table command) i])
+                                   :else                  [[(:on command) index]])
+                     created [(:on command) (:create-index command)]]
+                 (cond-> (update acc :dropped into (for [[t i] drops :when (and (named? t) (named? i))]
+                                                     [(catalog-name t) (catalog-name i)]))
+                   (and (every? named? created)
+                        (dropped (mapv catalog-name created)))
+                   (update :redefined conj (mapv catalog-name created)))))
+             {:dropped #{} :redefined #{}}
+             plan))))
+
 (defmethod generate-sql
   :alter-table
   [{table :alter-table add-columns :add-columns drop-columns :drop-columns modify-columns :modify-columns modify-column :modify-column
@@ -235,18 +258,23 @@
         ;; is dropped first, with `drop index if exists`, whatever the plan holds: an
         ;; earlier :drop-index emits nothing when its guard misses the index, so the
         ;; plan cannot say the index is gone.  Only this command's own :drop-index key,
-        ;; which is emitted unconditionally, makes the statement a duplicate.  Each
+        ;; which is emitted unconditionally, makes the statement a duplicate, and only
+        ;; a plan that redefines the index (drops it, then creates it again) leaves it
+        ;; alone: the create was emitted, so the index is the new one when this runs,
+        ;; and a new definition that still uses the column fails loudly (5074).  Each
         ;; index dropped here is added to the plan as a :drop-index, unless the plan
         ;; already holds that entry, so a later :create-index of the same name is
         ;; emitted rather than skipped by its guard, which reads the catalog before
         ;; anything executes and would still find the index.
         dependent-indexes
-        (let [own-drops (set (map catalog-name drop-indices))]
+        (let [own-drops (set (map catalog-name drop-indices))
+              redefined (delay (if *plan* (plan-redefined-indexes @*plan*) #{}))]
           (doall (for [index (distinct
                               (for [column removed-columns
                                     index (get-column-indexes *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
                                 index))
-                       :when (not (own-drops (catalog-name index)))]
+                       :when (not (own-drops (catalog-name index)))
+                       :when (not (@redefined [(catalog-name table) (catalog-name index)]))]
                    (let [entry {:drop-index (keyword index) :on table}]
                      (log/info "    * Removing index " (log/highlight index))
                      (when (and *plan* (not (some #{entry} @*plan*)))
