@@ -6,7 +6,8 @@
   (:import [java.util Date]
            [java.sql Connection PreparedStatement Statement Timestamp]))
 
-(declare primary-key-exists? get-primary-key foreign-key-exists? index-exists? column-exists? table-exists? get-column-constraints)
+(declare primary-key-exists? get-primary-key foreign-key-exists? index-exists? column-exists? table-exists? get-column-constraints
+         get-column-indexes get-column-defaults)
 
 (def ^:dynamic *db* nil)
 (def ^:dynamic *plan* nil)
@@ -151,6 +152,24 @@
   (log/info " - Dropping table" (log/highlight (name table)))
   [(jdbc/drop-table-ddl table)])
 
+(defn- catalog-name
+  "A name as the SQL Server catalog holds it: to-sql-name without statement quoting."
+  [k]
+  (to-sql-name k :quote-for-statement false))
+
+(defn- plan-dropped-indexes
+  "The [table index] pairs, as catalog names, that the commands in `plan` drop:
+  a `{:drop-index i :on t}` command, or the `:drop-index` key of an `:alter-table`.
+  A `:drop-index` command without `:on` names no table and is left out."
+  [plan]
+  (set (mapcat (fn [command]
+                 (let [index (:drop-index command)]
+                   (cond (nil? index) nil
+                         (:alter-table command) (for [i (if (sequential? index) index [index])]
+                                                  [(catalog-name (:alter-table command)) (catalog-name i)])
+                         (:on command) [[(catalog-name (:on command)) (catalog-name index)]])))
+               plan)))
+
 (defmethod generate-sql
   :alter-table
   [{table :alter-table add-columns :add-columns drop-columns :drop-columns modify-columns :modify-columns modify-column :modify-column
@@ -174,7 +193,7 @@
                         (format "%s %s"
                                 (to-sql-name column)
                                 (s/join " " specs))))))
-        removals
+        removed-columns
         (filter identity
                 (for [column drop-columns]
                   ;; Note: No test for prior alter table/add column or create table w/ column
@@ -183,10 +202,12 @@
                   (if (or (not *db*)
                           (column-exists? *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false)))
                     (do (log/info "    * Dropping column" (log/highlight (name column)))
-                        (to-sql-name column))
+                        column)
                     (do (log/info (format "   * Skipping DROP COLUMN %s.%s because that column does not exist."
                                           (to-sql-name table) (to-sql-name column)))
                         nil))))
+        removals
+        (map to-sql-name removed-columns)
         modification
         (if modify-column
           (let [[column & specs] modify-column]
@@ -222,6 +243,35 @@
                      constraint (get-column-constraints *db* (to-sql-name table) (to-sql-name column))]
                  (do (log/info "    * Removing constraint " (log/highlight constraint))
                      (to-sql-name constraint))))
+        ;; SQL Server refuses to drop a column that an index or a default constraint
+        ;; depends on (error 5074); MySQL and H2 drop those with the column.  So every
+        ;; index on a dropped column is dropped first, unless this migration already
+        ;; drops it (a :drop-index earlier in the plan or in this command).  Each index
+        ;; dropped here is added to the plan as a :drop-index, so a later :create-index
+        ;; of the same name is emitted rather than skipped by its guard, which reads
+        ;; the catalog before anything executes and would still find the index.
+        dependent-indexes
+        (let [already-dropped (into (set (for [index drop-indices]
+                                           [(catalog-name table) (catalog-name index)]))
+                                    (when *plan* (plan-dropped-indexes @*plan*)))]
+          (doall (for [index (distinct
+                              (for [column removed-columns
+                                    index (get-column-indexes *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
+                                index))
+                       :when (not (already-dropped [(catalog-name table) (catalog-name index)]))]
+                   (do (log/info "    * Removing index " (log/highlight index))
+                       (when *plan*
+                         (swap! *plan* concat [{:drop-index (keyword index) :on table}]))
+                       index))))
+        ;; A default constraint (sys.default_constraints: information_schema does not list
+        ;; defaults) joins the constraint drop that precedes the column drop.
+        old-defaults
+        (doall (for [default (distinct
+                              (for [column removed-columns
+                                    default (get-column-defaults *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
+                                default))]
+                 (do (log/info "    * Removing default constraint " (log/highlight default))
+                     (to-sql-name default))))
         old-constraints
         (filter #(and % (not ((set old-check-constraints) %)))
                 (doall (for [constraint drop-constraints]
@@ -244,11 +294,12 @@
             (when (not-empty opts)
               [opts])))
         ]
-    (let [check-drops
+    (let [column-constraints (concat old-check-constraints old-defaults)
+          check-drops
           (s/join ", " 
                   (filter identity
-                          [(if (not-empty old-check-constraints )
-                             (str "constraint if exists " (s/join "," old-check-constraints)) nil)]))
+                          [(if (not-empty column-constraints)
+                             (str "constraint if exists " (s/join "," column-constraints)) nil)]))
           drops (s/join ", " 
                         (filter identity
                                 [(if (not-empty old-constraints )
@@ -275,6 +326,8 @@
                                                                        (to-sql-name idx)
                                                                        (to-sql-name table)))
                                                              drop-indices)))])
+       (for [index dependent-indexes]
+         (format "drop index if exists %s on %s" (to-sql-name index) (to-sql-name table)))
        (mapcat (fn [column]
                  (generate-sql {:alter-table table :modify-column column}))
                modify-columns)
@@ -439,6 +492,44 @@
      ["select constraint_name from information_schema.constraint_column_usage where table_catalog=? and table_name=? and column_name=?"
       (:database db) table column]
      :row-fn :constraint_name)
+    []))
+
+(def ^:private column-indexes-sql
+  (str "SELECT i.name FROM sys.indexes i"
+       " JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id"
+       " JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id"
+       " JOIN sys.objects o ON o.object_id = i.object_id"
+       " WHERE o.name = ? AND c.name = ? AND i.name IS NOT NULL"
+       " AND i.is_primary_key = 0 AND i.is_unique_constraint = 0"))
+
+(defn- get-column-indexes
+  "Names of the indexes on `table` whose key or included columns contain
+  `column`, from sys.indexes; [] without a connection.  Indexes that back a
+  primary key or a unique constraint are left out: they are constraints, and
+  get-column-constraints finds them."
+  [db table column]
+  (if db
+    (jdbc/query
+     (db-spec db)
+     [column-indexes-sql table column]
+     :row-fn :name)
+    []))
+
+(def ^:private column-defaults-sql
+  (str "SELECT d.name FROM sys.default_constraints d"
+       " JOIN sys.columns c ON c.object_id = d.parent_object_id AND c.column_id = d.parent_column_id"
+       " JOIN sys.objects o ON o.object_id = d.parent_object_id"
+       " WHERE o.name = ? AND c.name = ?"))
+
+(defn- get-column-defaults
+  "Names of the default constraints on `column` of `table`, from
+  sys.default_constraints; [] without a connection."
+  [db table column]
+  (if db
+    (jdbc/query
+     (db-spec db)
+     [column-defaults-sql table column]
+     :row-fn :name)
     []))
 
 (defn- create-database
