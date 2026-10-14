@@ -40,7 +40,8 @@
   "generate-sql for `command` with the guard answering `answer`, *db* bound to
   a non-nil map and an empty plan."
   [answer command]
-  (with-redefs [sqlserver/index-exists? (fn [_ _ _] answer)]
+  ;; The stub says yes only for the exact (db, table, index) a generator must pass, so swapped or wrong arguments at a call site fail.
+  (with-redefs [sqlserver/index-exists? (fn [d t i] (and (= [d t i] [db "t" "x"]) answer))]
     (binding [sqlserver/*db*   db
               sqlserver/*plan* (atom [])]
       (sqlserver/generate-sql command))))

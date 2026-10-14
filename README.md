@@ -184,14 +184,14 @@ What if you slurp your project's entire history of migrations, and merge them? C
 
 ## SQL Server notes
 
-Before emitting `CREATE INDEX` or `DROP INDEX`, the SQL Server generator asks whether the index exists with `OBJECT_ID('<database>..<table>')`; the empty schema part is deliberate, because a two-part `<database>.<table>` is read as `<schema>.<table>`, resolves to NULL and makes every index look absent, while `<database>..<table>` names the database and leaves the schema to the login's default.
+Before emitting `CREATE INDEX` or `DROP INDEX`, the SQL Server generator asks whether the index exists with `OBJECT_ID('<database>..<table>')`; the empty schema part is deliberate, because a two-part `<database>.<table>` is read as `<schema>.<table>`, resolves to NULL and makes every index look absent, while `<database>..<table>` names the database and leaves the schema to the database user's default schema (`dbo` unless the user was created with another). The guard is consulted only when tern holds a connection; with no connection the generators emit the statement unguarded.
 
 `test/tern/sqlserver_live_test.clj` runs that check against a real SQL Server, configured by five environment variables:
 
 | Variable | Meaning |
 |---|---|
 | `TERN_SQLSERVER_HOST` | server host; when unset or blank the live test is skipped and registers nothing |
-| `TERN_SQLSERVER_PORT` | server port, default 1433 |
+| `TERN_SQLSERVER_PORT` | server port; 1433 when the variable is unset (a blank value is not defaulted) |
 | `TERN_SQLSERVER_DATABASE` | database to read |
 | `TERN_SQLSERVER_USER` | login |
 | `TERN_SQLSERVER_PASSWORD` | password |
