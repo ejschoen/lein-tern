@@ -182,6 +182,22 @@ An in-depth guide to extending Tern to work with more datastores is in the works
 Apart from supporting more commands and more datastores, the fact that Tern migrations are just Clojure maps leads to some interesting possibilities for exploration.
 What if you slurp your project's entire history of migrations, and merge them? Can they be merged in such a way as to eliminate changes that were later reverted or replaced, leaving you with a single, simple script to create a fresh database for your project in the shape it is now?
 
+## SQL Server notes
+
+Before emitting `CREATE INDEX` or `DROP INDEX`, the SQL Server generator asks whether the index exists with `OBJECT_ID('<database>..<table>')`; the empty schema part is deliberate, because a two-part `<database>.<table>` is read as `<schema>.<table>`, resolves to NULL and makes every index look absent, while `<database>..<table>` names the database and leaves the schema to the login's default.
+
+`test/tern/sqlserver_live_test.clj` runs that check against a real SQL Server, configured by five environment variables:
+
+| Variable | Meaning |
+|---|---|
+| `TERN_SQLSERVER_HOST` | server host; when unset or blank the live test is skipped and registers nothing |
+| `TERN_SQLSERVER_PORT` | server port, default 1433 |
+| `TERN_SQLSERVER_DATABASE` | database to read |
+| `TERN_SQLSERVER_USER` | login |
+| `TERN_SQLSERVER_PASSWORD` | password |
+
+With the host set, a blank database, user or password stops the run at load with a message naming only that variable. The live test is read-only: it reads the catalog for an existing table and its indexes and asks the guard about them; it creates, alters and drops nothing.
+
 ## Contributing
 
 Pull requests are welcome! Thank you for wanting to contribute. Here's the process we follow:
