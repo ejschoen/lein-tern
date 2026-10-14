@@ -100,10 +100,10 @@
 (def ^:private xom-indexes  {["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx"]})
 (def ^:private xom-defaults {["pending_updates" "lease_owner"] ["DF_pending_updates_lease_owner"]})
 
-;; XOM's failure without its :drop-index: the index and the default go first, then the columns.
+;; XOM's failure without its :drop-index: the index goes first, then the default and the
+;; columns together, in one ALTER TABLE that SQL Server applies whole or not at all.
 (expect ["drop index if exists pending_updates_lease_idx on pending_updates"
-         "ALTER TABLE pending_updates DROP constraint if exists DF_pending_updates_lease_owner"
-         "ALTER TABLE pending_updates DROP column lease_owner,lease_expires_at"]
+         "ALTER TABLE pending_updates DROP constraint if exists DF_pending_updates_lease_owner, column lease_owner,lease_expires_at"]
         (:sql (migrate-with-dependents [] xom-indexes xom-defaults [(dropping :pending_updates :lease_owner :lease_expires_at)])))
 
 ;; With nothing depending on the columns, only the column drop.
@@ -134,37 +134,70 @@
 
 ;; The lookups read sys.indexes and sys.default_constraints (information_schema lists
 ;; neither) in the bound database, with the table and column as catalog names:
-;; unbracketed and snake_case, as column-exists? is handed them.
-(expect [["i2kdocs" [expected-indexes-sql "user" "lease_owner"]]
-         ["i2kdocs" [expected-defaults-sql "user" "lease_owner"]]]
-        (dependent-lookup-queries :user :lease-owner))
+;; unbracketed and snake_case, as column-exists? is handed them.  `user` and `public`
+;; are the reserved words to-sql-name brackets in statements; concept-tags is a real
+;; kebab-case table (i2kdb 20160423191540).
+(expect [[["i2kdocs" [expected-indexes-sql "user" "lease_owner"]]
+          ["i2kdocs" [expected-defaults-sql "user" "lease_owner"]]]
+         [["i2kdocs" [expected-indexes-sql "concept_tags" "public"]]
+          ["i2kdocs" [expected-defaults-sql "concept_tags" "public"]]]]
+        [(dependent-lookup-queries :user :lease-owner)
+         (dependent-lookup-queries :concept-tags :public)])
+
+(defn- lookups-on-two-rows
+  "What the two lookups themselves return when the catalog answers two rows:
+  jdbc/query is stubbed to apply the :row-fn and :result-set-fn it is handed, as
+  java.jdbc does (defaults: identity and doall), to [{:name \"i1\"} {:name \"i2\"}]."
+  []
+  (with-redefs [jdbc/query (fn [_ _ & {:keys [row-fn result-set-fn]
+                                       :or   {row-fn identity result-set-fn doall}}]
+                             (result-set-fn (map row-fn [{:name "i1"} {:name "i2"}])))]
+    [(vec (#'sqlserver/get-column-indexes db "pending_updates" "state"))
+     (vec (#'sqlserver/get-column-defaults db "pending_updates" "state"))]))
+
+;; Every row comes back, in order: a column in two indexes (pending_updates.state is in
+;; four) needs every one of them dropped.
+(expect [["i1" "i2"] ["i1" "i2"]]
+        (lookups-on-two-rows))
 
 (def ^:private two-indexes
   {["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx" "pending_updates_other_idx"]})
 
-;; An index a :drop-index earlier in the migration drops is neither dropped again nor
-;; added to the plan again; the column's other index still is.
-(expect {:sql   ["drop index if exists pending_updates_other_idx on pending_updates"
-                 "ALTER TABLE pending_updates DROP column lease_expires_at"]
-         :added [{:drop-index :pending_updates_other_idx :on :pending_updates}]}
+(def ^:private after-planned-drop
+  {:sql   ["drop index if exists pending_updates_lease_idx on pending_updates"
+           "drop index if exists pending_updates_other_idx on pending_updates"
+           "ALTER TABLE pending_updates DROP column lease_expires_at"]
+   :added [{:drop-index :pending_updates_other_idx :on :pending_updates}]})
+
+;; A :drop-index earlier in the migration emits nothing when its guard misses the index,
+;; so every index the catalog shows is still dropped (if it exists); the plan already
+;; holds the earlier entry, so only the other index is added to it.
+(expect after-planned-drop
         (migrate-with-dependents [{:drop-index :pending_updates_lease_idx :on :pending_updates}]
                                  two-indexes {} [(dropping :pending_updates :lease_expires_at)]))
 
-;; Likewise an index the same :alter-table drops with its own :drop-index key.
-(expect {:sql   ["drop index if exists pending_updates_lease_idx on pending_updates"
-                 "drop index if exists pending_updates_other_idx on pending_updates"
-                 "ALTER TABLE pending_updates DROP column lease_expires_at"]
-         :added [{:drop-index :pending_updates_other_idx :on :pending_updates}]}
+(def ^:private with-own-drop-index
+  {:sql   ["drop index if exists pending_updates_lease_idx on pending_updates"
+           "drop index if exists pending_updates_other_idx on pending_updates"
+           "ALTER TABLE pending_updates DROP column lease_expires_at"]
+   :added [{:drop-index :pending_updates_other_idx :on :pending_updates}]})
+
+;; The command's own :drop-index key is always emitted, so its index is dropped once, by
+;; the key, and not again by the dependent list.
+(expect with-own-drop-index
         (migrate-with-dependents [] two-indexes {}
                                  [(assoc (dropping :pending_updates :lease_expires_at)
                                          :drop-index [:pending_updates_lease_idx])]))
 
+(def ^:private drop-then-create
+  ["drop index if exists pending_updates_lease_idx on pending_updates"
+   "ALTER TABLE pending_updates DROP column lease_expires_at"
+   "CREATE  INDEX pending_updates_lease_idx ON pending_updates (state)"])
+
 ;; A dependent index the generator drops is in the plan, so a :create-index of the same
 ;; name later in the migration is emitted, not skipped because the catalog (read before
 ;; anything runs) still lists it.
-(expect ["drop index if exists pending_updates_lease_idx on pending_updates"
-         "ALTER TABLE pending_updates DROP column lease_expires_at"
-         "CREATE  INDEX pending_updates_lease_idx ON pending_updates (state)"]
+(expect drop-then-create
         (:sql (migrate-with-dependents [] xom-indexes {}
                                        [(dropping :pending_updates :lease_expires_at)
                                         {:create-index :pending_updates_lease_idx :on :pending_updates :columns [:state]}])))
@@ -174,12 +207,24 @@
    ["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx"]
    ["pending_updates" "leased_at"]        ["pending_updates_lease_idx"]})
 
-;; An index on several dropped columns is dropped, and added to the plan, once: within one
-;; command and across two.
-(expect {:sql   ["drop index if exists pending_updates_lease_idx on pending_updates"
-                 "ALTER TABLE pending_updates DROP column lease_owner,lease_expires_at"
-                 "ALTER TABLE pending_updates DROP column leased_at"]
-         :added [{:drop-index :pending_updates_lease_idx :on :pending_updates}]}
+(def ^:private shared-index-twice
+  {:sql   ["drop index if exists pending_updates_lease_idx on pending_updates"
+           "ALTER TABLE pending_updates DROP column lease_owner,lease_expires_at"
+           "drop index if exists pending_updates_lease_idx on pending_updates"
+           "ALTER TABLE pending_updates DROP column leased_at"]
+   :added [{:drop-index :pending_updates_lease_idx :on :pending_updates}]})
+
+;; An index on several dropped columns: one statement per command (each command drops it
+;; if it still exists), and one plan entry for the whole migration.
+(expect shared-index-twice
         (migrate-with-dependents [] shared-index {}
                                  [(dropping :pending_updates :lease_owner :lease_expires_at)
                                   (dropping :pending_updates :leased_at)]))
+
+(def ^:private reserved-table
+  ["drop index if exists user_x_idx on [user]"
+   "ALTER TABLE [user] DROP column name"])
+
+;; In the statements a reserved-word table keeps the brackets to-sql-name gives it.
+(expect reserved-table
+        (:sql (migrate-with-dependents [] {["user" "name"] ["user_x_idx"]} {} [(dropping :user :name)])))

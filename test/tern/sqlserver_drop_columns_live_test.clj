@@ -14,14 +14,16 @@
   It writes, in the scratch database only, and only after SELECT DB_NAME()
   confirms that is where it is connected: it creates a table
   tern_dc_<UTC yyyyMMddHHmmss> (id INT NOT NULL, a VARCHAR(10) NULL, b INT NULL
-  DEFAULT 0) with an index on (a) and one on (id, b), checks that those three
-  dependents exist, binds `*db*` to the scratch database and `*plan*` to an
-  empty plan, runs `generate-sql` for `:drop-columns [:a :b]`, executes every
-  statement in order, and reads the catalog for what is left.  It prints one
-  DROP-COLUMNS-LIVE line.  The table is kept (the line ends table-kept) unless
-  TERN_SCRATCH_DROP_TABLE is true and every check passed; then the test drops
-  the table it created (table-dropped).  It never creates or drops a database.
-  Nothing it prints carries the login or the password."
+  DEFAULT 0) with two indexes on a, (a) and (a, id), and one on (id, b), checks
+  that those four dependents exist, binds `*db*` to the scratch database and
+  `*plan*` to an empty plan, runs `generate-sql` for `:drop-columns [:a :b]`,
+  executes every statement in order, and reads the catalog: a, b, the three
+  indexes and the default must be gone, the table and its column id still
+  there.  It prints one DROP-COLUMNS-LIVE line.  The table is kept (the line
+  ends table-kept) unless TERN_SCRATCH_DROP_TABLE is true and every check
+  passed; then the test drops the table it created (table-dropped).  It never
+  creates or drops a database.  Nothing it prints carries the login or the
+  password."
   (:require [tern.sqlserver    :as sqlserver]
             [tern.db           :refer [db-spec]]
             [clojure.java.jdbc :as jdbc]
@@ -80,11 +82,13 @@
   (set (map :n (jdbc/query conn (into [sql] params)))))
 
 (defn- dependents
-  "What the catalog holds for `table`, read without tern's own lookups: which of
-  the columns a and b exist, the table's named indexes, its default constraints."
+  "What the catalog holds for `table`, read without tern's own lookups: whether
+  the table exists, which of its columns id, a and b exist, its named indexes,
+  its default constraints."
   [conn table]
-  {:columns  (names conn (str "SELECT column_name AS n FROM information_schema.columns"
-                              " WHERE table_name = ? AND column_name IN ('a', 'b')")
+  {:tables   (names conn "SELECT name AS n FROM sys.tables WHERE name = ?" table)
+   :columns  (names conn (str "SELECT column_name AS n FROM information_schema.columns"
+                              " WHERE table_name = ? AND column_name IN ('id', 'a', 'b')")
                     table)
    :indexes  (names conn (str "SELECT i.name AS n FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id"
                               " WHERE o.name = ? AND i.name IS NOT NULL")
@@ -95,9 +99,17 @@
 
 (defn- expected-before
   [table]
-  {:columns  #{"a" "b"}
-   :indexes  #{(str table "_a_idx") (str table "_id_b_idx")}
+  {:tables   #{table}
+   :columns  #{"id" "a" "b"}
+   :indexes  #{(str table "_a_idx") (str table "_a2_idx") (str table "_id_b_idx")}
    :defaults 1})
+
+(defn- expected-after
+  [table]
+  {:tables   #{table}
+   :columns  #{"id"}
+   :indexes  #{}
+   :defaults #{}})
 
 (defn- before-summary
   [{:keys [before]}]
@@ -108,10 +120,10 @@
   [{:keys [table error after] :as result}]
   (and (nil? error)
        (= (expected-before table) (before-summary result))
-       (= {:columns #{} :indexes #{} :defaults #{}} after)))
+       (= (expected-after table) after)))
 
 (defn- run-drop-columns!
-  "Creates the table with its three dependents in the scratch database, has tern
+  "Creates the table with its four dependents in the scratch database, has tern
   drop the two columns, executes its statements in order, and reads the catalog.
   Never throws: a failure is returned under :error, scrubbed, naming the step."
   [db]
@@ -130,6 +142,7 @@
                        :transaction? false)
         (swap! result assoc :created true)
         (doseq [sql [(format "CREATE INDEX %s_a_idx ON %s (a)" table table)
+                     (format "CREATE INDEX %s_a2_idx ON %s (a, id)" table table)
                      (format "CREATE INDEX %s_id_b_idx ON %s (id, b)" table table)]]
           (jdbc/execute! conn [sql] :transaction? false))
         (reset! step "reading the catalog before")
@@ -163,9 +176,8 @@
                              ["FAILED"
                               (when (and before (not= (expected-before table) (before-summary result)))
                                 (str "dependents-before=" (pr-str before)))
-                              (when (seq (:columns after))  (str "columns-left=" (pr-str (:columns after))))
-                              (when (seq (:indexes after))  (str "indexes-left=" (pr-str (:indexes after))))
-                              (when (seq (:defaults after)) (str "defaults-left=" (pr-str (:defaults after))))
+                              (when (and after (not= (expected-after table) after))
+                                (str "after=" (pr-str after)))
                               (when error (str "error=" (pr-str error)))])))
        " "
        (cond dropped     "table-dropped"
@@ -178,7 +190,8 @@
       (println (str label "ran against " (:host db) "/" (:database db) " table " (:table result)))
       (println (result-line result))
 
-      ;; The table had what makes a column drop fail on SQL Server: two indexes and a default.
+      ;; The table had what makes a column drop fail on SQL Server: three indexes (two of
+      ;; them on a) and a default.
       (expect (expected-before (:table result))
               (before-summary result))
 
@@ -186,13 +199,16 @@
       (expect nil
               (:error result))
 
-      ;; The columns, both indexes and the default are gone.
-      (expect #{}
+      ;; a and b, the three indexes and the default are gone; the table and id are not.
+      (expect #{"id"}
               (:columns (:after result)))
 
       (expect #{}
               (:indexes (:after result)))
 
       (expect #{}
-              (:defaults (:after result))))
+              (:defaults (:after result)))
+
+      (expect #{(:table result)}
+              (:tables (:after result))))
     (println (str label "skipped (" skip ")"))))

@@ -157,19 +157,6 @@
   [k]
   (to-sql-name k :quote-for-statement false))
 
-(defn- plan-dropped-indexes
-  "The [table index] pairs, as catalog names, that the commands in `plan` drop:
-  a `{:drop-index i :on t}` command, or the `:drop-index` key of an `:alter-table`.
-  A `:drop-index` command without `:on` names no table and is left out."
-  [plan]
-  (set (mapcat (fn [command]
-                 (let [index (:drop-index command)]
-                   (cond (nil? index) nil
-                         (:alter-table command) (for [i (if (sequential? index) index [index])]
-                                                  [(catalog-name (:alter-table command)) (catalog-name i)])
-                         (:on command) [[(catalog-name (:on command)) (catalog-name index)]])))
-               plan)))
-
 (defmethod generate-sql
   :alter-table
   [{table :alter-table add-columns :add-columns drop-columns :drop-columns modify-columns :modify-columns modify-column :modify-column
@@ -244,27 +231,31 @@
                  (do (log/info "    * Removing constraint " (log/highlight constraint))
                      (to-sql-name constraint))))
         ;; SQL Server refuses to drop a column that an index or a default constraint
-        ;; depends on (error 5074); MySQL and H2 drop those with the column.  So every
-        ;; index on a dropped column is dropped first, unless this migration already
-        ;; drops it (a :drop-index earlier in the plan or in this command).  Each index
-        ;; dropped here is added to the plan as a :drop-index, so a later :create-index
-        ;; of the same name is emitted rather than skipped by its guard, which reads
-        ;; the catalog before anything executes and would still find the index.
+        ;; depends on (error 5074).  Every index the catalog shows on a dropped column
+        ;; is dropped first, with `drop index if exists`, whatever the plan holds: an
+        ;; earlier :drop-index emits nothing when its guard misses the index, so the
+        ;; plan cannot say the index is gone.  Only this command's own :drop-index key,
+        ;; which is emitted unconditionally, makes the statement a duplicate.  Each
+        ;; index dropped here is added to the plan as a :drop-index, unless the plan
+        ;; already holds that entry, so a later :create-index of the same name is
+        ;; emitted rather than skipped by its guard, which reads the catalog before
+        ;; anything executes and would still find the index.
         dependent-indexes
-        (let [already-dropped (into (set (for [index drop-indices]
-                                           [(catalog-name table) (catalog-name index)]))
-                                    (when *plan* (plan-dropped-indexes @*plan*)))]
+        (let [own-drops (set (map catalog-name drop-indices))]
           (doall (for [index (distinct
                               (for [column removed-columns
                                     index (get-column-indexes *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
                                 index))
-                       :when (not (already-dropped [(catalog-name table) (catalog-name index)]))]
-                   (do (log/info "    * Removing index " (log/highlight index))
-                       (when *plan*
-                         (swap! *plan* concat [{:drop-index (keyword index) :on table}]))
-                       index))))
+                       :when (not (own-drops (catalog-name index)))]
+                   (let [entry {:drop-index (keyword index) :on table}]
+                     (log/info "    * Removing index " (log/highlight index))
+                     (when (and *plan* (not (some #{entry} @*plan*)))
+                       (swap! *plan* concat [entry]))
+                     index))))
         ;; A default constraint (sys.default_constraints: information_schema does not list
-        ;; defaults) joins the constraint drop that precedes the column drop.
+        ;; defaults) is dropped in the same ALTER TABLE statement as its column, which SQL
+        ;; Server applies whole or not at all: a column drop that still fails leaves the
+        ;; column with its default.
         old-defaults
         (doall (for [default (distinct
                               (for [column removed-columns
@@ -294,16 +285,16 @@
             (when (not-empty opts)
               [opts])))
         ]
-    (let [column-constraints (concat old-check-constraints old-defaults)
-          check-drops
+    (let [check-drops
           (s/join ", " 
                   (filter identity
-                          [(if (not-empty column-constraints)
-                             (str "constraint if exists " (s/join "," column-constraints)) nil)]))
+                          [(if (not-empty old-check-constraints )
+                             (str "constraint if exists " (s/join "," old-check-constraints)) nil)]))
+          table-constraints (concat old-constraints old-defaults)
           drops (s/join ", " 
                         (filter identity
-                                [(if (not-empty old-constraints )
-                                   (str "constraint if exists " (s/join "," old-constraints))
+                                [(if (not-empty table-constraints)
+                                   (str "constraint if exists " (s/join "," table-constraints))
                                    nil
                                    ) 
                                  (if (not-empty removals)
