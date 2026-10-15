@@ -209,6 +209,10 @@
         [(create-table-after [{:drop-table "t"}])
          (create-table-after [{:drop-table :t :sqlserver "DROP TABLE t"}])])
 
+;; ... and a :drop-table of another table leaves it skipped.
+(expect [nil nil]
+        (create-table-after [{:drop-table :u}]))
+
 (def ^:private chathistory-up
   "i2kdb 20250427121101-chathistory_conversations.edn's :up: the table is dropped and
   created again with two foreign keys and five indexes; 20240622220001 had created
