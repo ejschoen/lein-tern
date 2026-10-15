@@ -7,7 +7,10 @@
   the guard is consulted (with `*db*` nil, as in `tern.sqlserver-test`, the
   generators never ask it).  `:drop-columns` is checked the same way: its
   dependent-index and default-constraint lookups are replaced by a fake catalog
-  that answers only for the bound `*db*` and the exact table and column."
+  that answers only for the bound `*db*` and the exact table and column.  The
+  create guard's reading of the plan is checked with the guard saying yes for the
+  exact (db, table, index), and the check-constraint lookup by capturing the
+  query it sends."
   (:require [tern.sqlserver    :as sqlserver]
             [clojure.java.jdbc :as jdbc]
             [expectations      :refer :all]))
@@ -61,6 +64,44 @@
 
 (expect ["CREATE  INDEX x ON t (a)"]
         (generate-with-guard false {:create-index :x :on :t :columns [:a]}))
+
+;; ---------------------------------------------------------------------------
+;; While the guard finds the index, CREATE INDEX is still emitted when an earlier command
+;; in the migration drops it: a {:drop-index i :on t} command or an :alter-table's
+;; :drop-index key, the table and index compared as catalog names.
+
+(defn- create-after
+  "generate-sql for a :create-index of `index` (a snake_case keyword, its name the
+  catalog name) on :t, *db* bound, the guard saying yes only for the bound db,
+  table \"t\" and that index, the arguments the generator must pass.  Returns
+  [what an empty plan gives, what `plan` gives]: the first is nil only if the
+  guard said yes, so the second emitting the CREATE is the plan's doing."
+  [plan index]
+  (with-redefs [sqlserver/index-exists? (fn [d t i] (= [d t i] [db "t" (name index)]))]
+    (vec (for [p [[] plan]]
+           (binding [sqlserver/*db*   db
+                     sqlserver/*plan* (atom p)]
+             (sqlserver/generate-sql {:create-index index :on :t :columns [:a]}))))))
+
+;; An :alter-table's :drop-index key (a vector, no :on) counts as a drop of each index on
+;; that table.
+(expect [nil ["CREATE  INDEX x ON t (a)"]]
+        (create-after [{:alter-table :t :drop-index [:x]}] :x))
+
+;; A kebab-case drop and a snake_case create name the same catalog index.
+(expect [nil ["CREATE  INDEX my_idx ON t (a)"]]
+        (create-after [{:drop-index :my-idx :on :t}] :my_idx))
+
+;; So do a drop that names the index and the table as strings and a keyword create.
+(expect [nil ["CREATE  INDEX my_idx ON t (a)"]]
+        (create-after [{:drop-index "my_idx" :on "t"}] :my_idx))
+
+;; The table matters: a drop of x on another table, in either form, leaves the create on t
+;; skipped, and so does a :drop-index that names no table.
+(expect [[nil nil] [nil nil] [nil nil]]
+        [(create-after [{:drop-index :x :on :u}] :x)
+         (create-after [{:alter-table :u :drop-index [:x]}] :x)
+         (create-after [{:drop-index :x}] :x)])
 
 ;; ---------------------------------------------------------------------------
 ;; :drop-columns drops what depends on the column first: SQL Server refuses to
@@ -170,6 +211,60 @@
           ["i2kdocs" [expected-defaults-sql "concept_tags" "public"]]]]
         [(dependent-lookup-queries :user :lease-owner)
          (dependent-lookup-queries :concept-tags :public)])
+
+(def ^:private expected-constraints-sql
+  "select constraint_name from information_schema.constraint_column_usage where table_catalog=? and table_name=? and column_name=?")
+
+(def ^:private check-constraints
+  {["user" "name"]           ["CK_user_name"]
+   ["concept_tags" "public"] ["CK_concept_tags_public"]})
+
+(defn- dropping-with-check
+  "Drops `column` from `table` with jdbc/query stubbed as the catalog: it captures
+  [database sql-params] for every query and answers the check-constraint lookup
+  (applying the :row-fn it is handed, as java.jdbc does) only when handed the bound
+  database and a [table column] of `check-constraints` as catalog names; every
+  other query finds nothing.  The column exists only for the bound db and those
+  exact names.  Returns {:queries [...] :sql [...]}."
+  [table column]
+  (let [captured (atom [])]
+    (with-redefs [sqlserver/column-exists? (fn [d t c] (and (= d db) (contains? check-constraints [t c])))
+                  jdbc/query               (fn [spec [sql & params :as sql-params] & {:keys [row-fn result-set-fn]
+                                                                                       :or   {row-fn identity result-set-fn doall}}]
+                                             (swap! captured conj [(:database spec) sql-params])
+                                             (let [[catalog t c] params
+                                                   rows (if (and (= (:database spec) "i2kdocs")
+                                                                 (= sql expected-constraints-sql)
+                                                                 (= catalog "i2kdocs"))
+                                                          (map (fn [n] {:constraint_name n}) (get check-constraints [t c]))
+                                                          [])]
+                                               (result-set-fn (map row-fn rows))))]
+      (binding [sqlserver/*db*   db
+                sqlserver/*plan* (atom [])]
+        (let [sql (vec (sqlserver/generate-sql (dropping table column)))]
+          {:queries @captured :sql sql})))))
+
+;; The check-constraint lookup (information_schema.constraint_column_usage, compared with
+;; table_name = ? and column_name = ?) is handed catalog names, as the dependent lookups
+;; are: a reserved-word table (user) or column (public) unbracketed, a kebab-case table in
+;; snake_case.
+(expect [[["i2kdocs" [expected-constraints-sql "i2kdocs" "user" "name"]]
+          ["i2kdocs" [expected-indexes-sql "user" "name"]]
+          ["i2kdocs" [expected-defaults-sql "user" "name"]]]
+         [["i2kdocs" [expected-constraints-sql "i2kdocs" "concept_tags" "public"]]
+          ["i2kdocs" [expected-indexes-sql "concept_tags" "public"]]
+          ["i2kdocs" [expected-defaults-sql "concept_tags" "public"]]]]
+        [(:queries (dropping-with-check :user :name))
+         (:queries (dropping-with-check :concept-tags :public))])
+
+;; So a check constraint it finds is dropped before the column, in a statement that names
+;; the table and the column as to-sql-name gives them.
+(expect [["ALTER TABLE [user] DROP constraint if exists CK_user_name"
+          "ALTER TABLE [user] DROP column name"]
+         ["ALTER TABLE concept_tags DROP constraint if exists CK_concept_tags_public"
+          "ALTER TABLE concept_tags DROP column [public]"]]
+        [(:sql (dropping-with-check :user :name))
+         (:sql (dropping-with-check :concept-tags :public))])
 
 (defn- lookups-on-three-rows
   "What the two lookups themselves return when the catalog answers three rows:

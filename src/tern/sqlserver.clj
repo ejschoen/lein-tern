@@ -157,6 +157,19 @@
   [k]
   (to-sql-name k :quote-for-statement false))
 
+(defn- plan-dropped-indexes
+  "The [table index] pairs, as catalog names, that the commands in `plan` drop:
+  a `{:drop-index i :on t}` command, or the `:drop-index` key of an `:alter-table`.
+  A `:drop-index` command without `:on` names no table and is left out."
+  [plan]
+  (set (mapcat (fn [command]
+                 (let [index (:drop-index command)]
+                   (cond (nil? index) nil
+                         (:alter-table command) (for [i (if (sequential? index) index [index])]
+                                                  [(catalog-name (:alter-table command)) (catalog-name i)])
+                         (:on command) [[(catalog-name (:on command)) (catalog-name index)]])))
+               plan)))
+
 (defn- sql-literal
   "`s` as a T-SQL string literal, single quotes doubled."
   [s]
@@ -256,7 +269,7 @@
                               " because it already exists"))))
         old-check-constraints
         (doall (for [column drop-columns
-                     constraint (get-column-constraints *db* (to-sql-name table) (to-sql-name column))]
+                     constraint (get-column-constraints *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
                  (do (log/info "    * Removing constraint " (log/highlight constraint))
                      (to-sql-name constraint))))
         ;; SQL Server refuses to drop a column that an index or a default constraint
@@ -380,10 +393,7 @@
     unique  :unique}]
   (if (and *db*
            (index-exists? *db* (to-sql-name table) (to-sql-name index))
-           (not (some (fn [prior]
-                        (and (= index (:drop-index prior))
-                             (= table (:on prior))))
-                      @*plan*)))
+           (not (contains? (plan-dropped-indexes @*plan*) [(catalog-name table) (catalog-name index)])))
     (do (log/info (format "   * Skipping CREATE INDEX on table %s name %s because it already exists."
                           (to-sql-name table) (to-sql-name index)))
         nil)
