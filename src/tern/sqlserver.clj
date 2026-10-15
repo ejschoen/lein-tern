@@ -192,34 +192,40 @@
              :when table]
          (catalog-name table))))
 
-(defn- sql-literal
-  "`s` as a T-SQL string literal, single quotes doubled."
-  [s]
-  (str "'" (s/replace (str s) "'" "''") "'"))
+(defn- exit!
+  "Ends the process with `status`, as tern does when a migration cannot be run.
+  A var, so that a test can trap the exit."
+  [status]
+  (System/exit status))
 
-(defn- bracketed
-  "`s` as a T-SQL bracket-delimited identifier, as QUOTENAME makes one: [s] with
-  each ] doubled (a [ inside needs no escape)."
-  [s]
-  (str "[" (s/replace (str s) "]" "]]") "]"))
-
-(defn- drop-index-if-it-holds
-  "One statement that drops `index` from `table` only if, when it runs, the index
-  still contains one of `columns`, the columns the command drops: the catalog is
-  read at execution time, so an index the migration has meanwhile dropped, or
-  redefined without those columns (by :create-index, raw SQL or an override), is
-  left alone, and one redefined to hold any of them is dropped.  `index` and
-  `columns` are catalog names; the predicate carries them as literals, the DROP
-  the index bracketed and the table as to-sql-name gives it."
-  [table index columns]
-  (format (str "IF EXISTS (SELECT 1 FROM sys.indexes i"
-               " JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id"
-               " JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id"
-               " JOIN sys.objects o ON o.object_id = i.object_id"
-               " WHERE o.name = %s AND i.name = %s AND c.name IN (%s))"
-               " DROP INDEX %s ON %s")
-          (sql-literal (catalog-name table)) (sql-literal index) (s/join ", " (map sql-literal columns))
-          (bracketed index) (to-sql-name table)))
+(defn- refuse-indexed-column-drops!
+  "SQL Server refuses to drop a column that an index contains (error 5074).  When
+  an :alter-table of `table` drops `columns` and the catalog (get-column-indexes,
+  read while the migration's SQL is generated) shows an index containing one of
+  them that the migration does not drop first, this stops the migration before
+  any of its statements runs: one error line per column and index, then the
+  exit, as tern's other refusals do.  An index counts as dropped first when an
+  earlier {:drop-index i :on table} command or :alter-table :drop-index key, or
+  this command's own :drop-index key (`own-drops`), names it, compared as catalog
+  names, or when an earlier {:drop-table table} drops the whole table.  Indexes
+  that back a primary key or a unique constraint are not looked up here: they are
+  constraints, dropped before the column with its other constraints."
+  [table columns own-drops]
+  (let [table-name (catalog-name table)
+        plan       (if *plan* @*plan* [])
+        dropped    (plan-dropped-indexes (concat plan [{:alter-table table :drop-index own-drops}]))
+        remaining  (when-not (contains? (plan-dropped-tables plan) table-name)
+                     (doall (for [column columns
+                                  index  (get-column-indexes *db* table-name (catalog-name column))
+                                  :when  (not (contains? dropped [table-name (catalog-name index)]))]
+                              [(catalog-name column) index])))]
+    (when (seq remaining)
+      (doseq [[column index] remaining]
+        (log/error (format (str "tern: cannot drop column %s.%s on SQL Server: index %s still contains it;"
+                                " drop the index first in this migration (:drop-index), or remove a stale"
+                                " index by hand (see the SQL Server migration runbook, section 5a)")
+                           table-name column index)))
+      (exit! 1))))
 
 (defmethod generate-sql
   :alter-table
@@ -291,29 +297,10 @@
                      constraint (get-column-constraints *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
                  (do (log/info "    * Removing constraint " (log/highlight constraint))
                      (to-sql-name constraint))))
-        ;; SQL Server refuses to drop a column that an index or a default constraint
-        ;; depends on (error 5074).  Every index the catalog shows on a dropped column
-        ;; gets one statement that drops it only if, when the statement runs, it still
-        ;; contains one of the columns this command drops (drop-index-if-it-holds): the
-        ;; plan cannot say what earlier statements did (a :drop-index whose guard
-        ;; missed, an index re-created by :create-index, raw SQL or an override), the
-        ;; catalog at execution time can.  Only this command's own :drop-index key,
-        ;; which is emitted unconditionally, makes the statement redundant.  Each index found here is added to the plan as
-        ;; a :drop-index, unless the plan already holds that entry, so a later
-        ;; :create-index of the same name is emitted rather than skipped by its guard,
-        ;; which reads the catalog before anything executes and would still find it.
-        dependent-indexes
-        (let [own-drops (set (map catalog-name drop-indices))]
-          (doall (for [index (distinct
-                              (for [column removed-columns
-                                    index (get-column-indexes *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
-                                index))
-                       :when (not (own-drops (catalog-name index)))]
-                   (let [entry {:drop-index (keyword index) :on table}]
-                     (log/info "    * Removing index" (log/highlight index) "if it still contains a dropped column")
-                     (when (and *plan* (not (some #{entry} @*plan*)))
-                       (swap! *plan* concat [entry]))
-                     index))))
+        ;; An index that still contains a dropped column stops the migration here, while
+        ;; its SQL is generated: the migration must drop the index first.
+        _ (refuse-indexed-column-drops! table removed-columns drop-indices)
+        ;; SQL Server also refuses to drop a column that a default constraint depends on.
         ;; A default constraint (sys.default_constraints: information_schema does not list
         ;; defaults) is dropped in the same ALTER TABLE statement as its column, which SQL
         ;; Server applies whole or not at all: a column drop that still fails leaves the
@@ -379,9 +366,6 @@
                                                                        (to-sql-name idx)
                                                                        (to-sql-name table)))
                                                              drop-indices)))])
-       (let [columns (map #(to-sql-name % :quote-for-statement false) removed-columns)]
-         (for [index dependent-indexes]
-           (drop-index-if-it-holds table index columns)))
        (mapcat (fn [column]
                  (generate-sql {:alter-table table :modify-column column}))
                modify-columns)

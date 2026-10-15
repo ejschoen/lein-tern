@@ -7,7 +7,12 @@
   the guard is consulted (with `*db*` nil, as in `tern.sqlserver-test`, the
   generators never ask it).  `:drop-columns` is checked the same way: its
   dependent-index and default-constraint lookups are replaced by a fake catalog
-  that answers only for the bound `*db*` and the exact table and column.  The
+  that answers only for the bound `*db*` and the exact table and column, and its
+  refusal of an index that still contains a dropped column is checked by trapping
+  tern's exit (`tern.sqlserver/exit!`, replaced by a stub that records the status
+  and throws, as System/exit never returns) and capturing `tern.log/error`; one
+  case runs tern's own run-migration! with the connection and the executor
+  replaced, to show the refusal comes before the first statement.  The
   create guard's reading of the plan is checked with the guard saying yes for the
   exact (db, table, index), the add-constraints guard's with the foreign-key
   lookup saying yes for the exact (db, constraint), the create-table guard's with
@@ -15,6 +20,7 @@
   lookup by capturing the query it sends."
   (:require [tern.sqlserver    :as sqlserver]
             [tern.db           :as tern-db]
+            [tern.log          :as log]
             [clojure.java.jdbc :as jdbc]
             [expectations      :refer :all]))
 
@@ -324,79 +330,235 @@
                               feedback-up))
 
 ;; ---------------------------------------------------------------------------
-;; :drop-columns drops what depends on the column first: SQL Server refuses to
-;; drop a column that an index or a default constraint depends on (error 5074).
+;; :drop-columns: SQL Server refuses to drop a column that an index or a default
+;; constraint depends on (error 5074).  The default is dropped in the column's own
+;; statement; an index that still contains the column must be dropped earlier in the
+;; migration, or tern stops the migration while its SQL is generated.
 
 (defn- dropping
   "An :alter-table command dropping `columns` from `table`."
   [table & columns]
   {:alter-table table :drop-columns (vec columns)})
 
-(defn- migrate-with-dependents
-  "Runs `commands` through generate-sql as run-migration! does: *db* bound, one
-  plan atom starting at `plan`, each command appended to the plan after its SQL
-  is generated.  Every column exists and has no check constraint; `indexes` and
-  `defaults` map [table column] to the names the two dependent lookups find, and
-  the guard finds exactly those indexes.  The lookups answer only when handed the
-  bound *db*, so a call site that passes nil or another db finds nothing.
-  Returns the statements and the plan entries generate-sql itself added."
-  [plan indexes defaults commands]
+(defn- fake-catalog
+  "Var bindings, for with-redefs-fn, of a catalog in which every column exists and
+  has no check constraint, `indexes` and `defaults` map [table column] to the names
+  the two dependent lookups find, and the guard finds exactly those indexes.  The
+  lookups answer only when handed the bound *db*, so a call site that passes nil or
+  another db finds nothing.  tern's exit records its status in `exit` and throws, as
+  System/exit never returns; the lines tern logs as errors go to `errors`."
+  [indexes defaults exit errors]
   (let [catalog (set (for [[[t _] names] indexes, i names] [t i]))]
-    (with-redefs [sqlserver/column-exists?          (fn [_ _ _] true)
-                  sqlserver/get-column-constraints  (fn [_ _ _] [])
-                  sqlserver/get-column-indexes      (fn [d t c] (if (= d db) (get indexes [t c] []) []))
-                  sqlserver/get-column-defaults     (fn [d t c] (if (= d db) (get defaults [t c] []) []))
-                  sqlserver/index-exists?           (fn [d t i] (and (= d db) (contains? catalog [t i])))]
-      (binding [sqlserver/*db*   db
-                sqlserver/*plan* (atom plan)]
-        (reduce (fn [acc command]
-                  (let [before (count @sqlserver/*plan*)
-                        sql    (doall (sqlserver/generate-sql command))
-                        added  (doall (drop before @sqlserver/*plan*))]
-                    (swap! sqlserver/*plan* concat [command])
-                    (-> acc (update :sql into sql) (update :added into added))))
-                {:sql [] :added []}
-                commands)))))
+    {#'sqlserver/column-exists?         (fn [_ _ _] true)
+     #'sqlserver/get-column-constraints (fn [_ _ _] [])
+     #'sqlserver/get-column-indexes     (fn [d t c] (if (= d db) (get indexes [t c] []) []))
+     #'sqlserver/get-column-defaults    (fn [d t c] (if (= d db) (get defaults [t c] []) []))
+     #'sqlserver/index-exists?          (fn [d t i] (and (= d db) (contains? catalog [t i])))
+     #'sqlserver/exit!                  (fn [status]
+                                          (reset! exit status)
+                                          (throw (ex-info "tern requested its exit" {::exit status})))
+     #'log/error                        (fn [& args] (swap! errors conj (clojure.string/join " " args)))}))
 
-(def ^:private xom-indexes  {["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx"]})
-(def ^:private xom-defaults {["pending_updates" "lease_owner"] ["DF_pending_updates_lease_owner"]})
+(defn- exit-thrown?
+  [e]
+  (contains? (ex-data e) ::exit))
 
-;; XOM's failure without its :drop-index: the index goes first, dropped only if, when the
-;; statement runs, it still contains one of the columns the command drops (the exact
-;; predicate text for this table, index and the two columns), then the default and the
-;; columns together, in one ALTER TABLE that SQL Server applies whole or not at all.
-(expect ["IF EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = 'pending_updates' AND i.name = 'pending_updates_lease_idx' AND c.name IN ('lease_owner', 'lease_expires_at')) DROP INDEX [pending_updates_lease_idx] ON pending_updates"
-         "ALTER TABLE pending_updates DROP constraint if exists DF_pending_updates_lease_owner, column lease_owner,lease_expires_at"]
-        (:sql (migrate-with-dependents [] xom-indexes xom-defaults [(dropping :pending_updates :lease_owner :lease_expires_at)])))
+(defn- migrate-with-dependents
+  "Runs `commands` through generate-sql as run-migration! does, over fake-catalog:
+  *db* bound, one plan atom starting at `plan`, each command appended to the plan
+  after its SQL is generated; a requested exit ends the run there.  Returns {:sql the
+  statements generated before any exit, :errors the lines tern logged as errors,
+  :exit the status of the requested exit, or nil}."
+  [plan indexes defaults commands]
+  (let [sql    (atom [])
+        errors (atom [])
+        exit   (atom nil)]
+    (with-redefs-fn (fake-catalog indexes defaults exit errors)
+      (fn []
+        (binding [sqlserver/*db*   db
+                  sqlserver/*plan* (atom plan)]
+          (try
+            (doseq [command commands]
+              (let [statements (doall (sqlserver/generate-sql command))]
+                (swap! sqlserver/*plan* concat [command])
+                (swap! sql into statements)))
+            (catch clojure.lang.ExceptionInfo e
+              (when-not (exit-thrown? e) (throw e)))))))
+    {:sql @sql :errors @errors :exit @exit}))
+
+(defn- refusal
+  "The line tern logs when `column` of `table` cannot be dropped because `index` still
+  contains it."
+  [table column index]
+  (str "tern: cannot drop column " table "." column " on SQL Server: index " index " still contains it;"
+       " drop the index first in this migration (:drop-index), or remove a stale index by hand"
+       " (see the SQL Server migration runbook, section 5a)"))
+
+(def ^:private t-a-index   {["t" "a"] ["ix_a"]})
+(def ^:private t-a-default {["t" "a"] ["DF_t_a"]})
+
+(def ^:private column-and-default
+  "ALTER TABLE t DROP constraint if exists DF_t_a, column a")
+
+;; (a) An index on the dropped column that the migration does not drop: tern logs one line
+;; naming the table, the column and the index, and requests its exit; nothing is generated.
+(expect {:sql    []
+         :errors ["tern: cannot drop column t.a on SQL Server: index ix_a still contains it; drop the index first in this migration (:drop-index), or remove a stale index by hand (see the SQL Server migration runbook, section 5a)"]
+         :exit   1}
+        (migrate-with-dependents [] t-a-index t-a-default [(dropping :t :a)]))
+
+;; (b) After an earlier {:drop-index ix_a :on t} the command is accepted: no IF EXISTS and
+;; no DROP INDEX statement, and the default still goes in the column's statement.
+(expect {:sql [column-and-default] :errors [] :exit nil}
+        (migrate-with-dependents [{:drop-index :ix_a :on :t}] t-a-index t-a-default [(dropping :t :a)]))
+
+;; (c) The command's own :drop-index key naming the index: accepted, the key's own statement
+;; first.
+(expect {:sql ["drop index if exists ix_a on t" column-and-default] :errors [] :exit nil}
+        (migrate-with-dependents [] t-a-index t-a-default [(assoc (dropping :t :a) :drop-index [:ix_a])]))
+
+;; (d) After an earlier :drop-table of t, which drops every index on it: accepted.
+(expect {:sql [column-and-default] :errors [] :exit nil}
+        (migrate-with-dependents [{:drop-table :t}] t-a-index t-a-default [(dropping :t :a)]))
+
+;; (e) An index on another column of the table does not depend on a: accepted.
+(expect {:sql [column-and-default] :errors [] :exit nil}
+        (migrate-with-dependents [] {["t" "b"] ["ix_b"]} t-a-default [(dropping :t :a)]))
+
+;; An earlier :alter-table's :drop-index key on t drops the index too: accepted.
+(expect {:sql [column-and-default] :errors [] :exit nil}
+        (migrate-with-dependents [{:alter-table :t :drop-index [:ix_a]}] t-a-index t-a-default [(dropping :t :a)]))
+
+(def ^:private refused-ix-a
+  {:sql [] :errors [(refusal "t" "a" "ix_a")] :exit 1})
+
+;; Only a drop of that index on that table counts: the index dropped on another table (in
+;; either form), a :drop-index that names no table, a :drop-table of another table, or a
+;; :create-index of the index (its guard skips it while it exists) leaves the refusal.
+(expect [refused-ix-a refused-ix-a refused-ix-a refused-ix-a refused-ix-a]
+        (vec (for [plan [[{:drop-index :ix_a :on :u}]
+                         [{:alter-table :u :drop-index [:ix_a]}]
+                         [{:drop-index :ix_a}]
+                         [{:drop-table :u}]
+                         [{:create-index :ix_a :on :t :columns [:b]}]]]
+               (migrate-with-dependents plan t-a-index t-a-default [(dropping :t :a)]))))
+
+;; The plan's drops and the command's own key are compared with the catalog as catalog
+;; names: a kebab-case index or table, or one written as a string, is the snake_case one the
+;; catalog holds.
+(expect [{:sql ["ALTER TABLE my_table DROP column my_col"] :errors [] :exit nil}
+         {:sql ["ALTER TABLE my_table DROP column my_col"] :errors [] :exit nil}
+         {:sql ["drop index if exists my_idx on my_table" "ALTER TABLE my_table DROP column my_col"] :errors [] :exit nil}]
+        (vec (for [[plan command] [[[{:drop-index :my-idx :on :my-table}] (dropping :my_table :my-col)]
+                                   [[{:drop-index "my_idx" :on "my_table"}] (dropping :my-table :my_col)]
+                                   [[] (assoc (dropping :my_table :my_col) :drop-index [:my-idx])]]]
+               (migrate-with-dependents plan {["my_table" "my_col"] ["my_idx"]} {} [command]))))
+
+(def ^:private user-index {["user" "name"] ["user_x_idx"]})
+
+;; A reserved-word table: the line names it as the catalog holds it, user, and a drop of the
+;; index on :user counts; statements still bracket it.
+(expect [{:sql [] :errors [(refusal "user" "name" "user_x_idx")] :exit 1}
+         {:sql ["ALTER TABLE [user] DROP column name"] :errors [] :exit nil}]
+        [(migrate-with-dependents [] user-index {} [(dropping :user :name)])
+         (migrate-with-dependents [{:drop-index :user_x_idx :on :user}] user-index {} [(dropping :user :name)])])
+
+(def ^:private two-indexes
+  {["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx" "pending_updates_other_idx"]})
+
+(def ^:private refused-other-idx
+  {:sql [] :errors [(refusal "pending_updates" "lease_expires_at" "pending_updates_other_idx")] :exit 1})
+
+;; Each index is checked on its own: with two on the column and one dropped earlier, the
+;; other is refused by name ...
+(expect refused-other-idx
+        (migrate-with-dependents [{:drop-index :pending_updates_lease_idx :on :pending_updates}]
+                                 two-indexes {} [(dropping :pending_updates :lease_expires_at)]))
+
+;; ... and so it is when the command's own :drop-index key names the first: the refused
+;; command generates nothing, its own index drop included.
+(expect refused-other-idx
+        (migrate-with-dependents [] two-indexes {}
+                                 [(assoc (dropping :pending_updates :lease_expires_at)
+                                         :drop-index [:pending_updates_lease_idx])]))
+
+;; One line per dropped column and index that still contains it, then one exit: ix_ab holds
+;; both dropped columns, ix_b only b, and ix_c a column the command keeps.
+(expect {:sql [] :errors [(refusal "t" "a" "ix_ab") (refusal "t" "b" "ix_ab") (refusal "t" "b" "ix_b")] :exit 1}
+        (migrate-with-dependents [] {["t" "a"] ["ix_ab"] ["t" "b"] ["ix_ab" "ix_b"] ["t" "c"] ["ix_c"]} {}
+                                 [(dropping :t :a :b)]))
+
+(def ^:private lease-indexes  {["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx"]})
+(def ^:private lease-defaults {["pending_updates" "lease_owner"] ["DF_pending_updates_lease_owner"]})
+
+;; The real shape (i2kdb 20260816100000 drops pending_updates_lease_idx, then lease_owner and
+;; lease_expires_at): without its :drop-index the column drop is refused; with it, as the
+;; migration has it, the index goes by that command, and the default and both columns in one
+;; ALTER TABLE, which SQL Server applies whole or not at all.
+(expect [{:sql [] :errors [(refusal "pending_updates" "lease_expires_at" "pending_updates_lease_idx")] :exit 1}
+         {:sql    ["DROP INDEX pending_updates_lease_idx ON pending_updates"
+                   "ALTER TABLE pending_updates DROP constraint if exists DF_pending_updates_lease_owner, column lease_owner,lease_expires_at"]
+          :errors []
+          :exit   nil}]
+        [(migrate-with-dependents [] lease-indexes lease-defaults
+                                  [(dropping :pending_updates :lease_owner :lease_expires_at)])
+         (migrate-with-dependents [] lease-indexes lease-defaults
+                                  [{:drop-index :pending_updates_lease_idx :on :pending_updates}
+                                   (dropping :pending_updates :lease_owner :lease_expires_at)])])
 
 ;; With nothing depending on the columns, only the column drop.
 (expect ["ALTER TABLE pending_updates DROP column lease_owner,lease_expires_at"]
         (:sql (migrate-with-dependents [] {} {} [(dropping :pending_updates :lease_owner :lease_expires_at)])))
 
-(defn- if-holds
-  "The statement expected for `index` on `table` when the command drops `columns`
-  (catalog names, quote-free; `on` is the table as the DROP names it, `table`
-  unless given)."
-  ([table index columns] (if-holds table index columns table))
-  ([table index columns on]
-   (str "IF EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id"
-        " JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id"
-        " WHERE o.name = '" table "' AND i.name = '" index "' AND c.name IN ("
-        (clojure.string/join ", " (map #(str "'" % "'") columns)) "))"
-        " DROP INDEX [" index "] ON " on)))
+;; An index dropped by the command's own key and created again later in the migration, on a
+;; column the command keeps, is created: the command, in the plan once generated, drops it.
+(expect {:sql ["drop index if exists ix_a on t" column-and-default "CREATE  INDEX ix_a ON t (b)"] :errors [] :exit nil}
+        (migrate-with-dependents [] t-a-index t-a-default
+                                 [(assoc (dropping :t :a) :drop-index [:ix_a])
+                                  {:create-index :ix_a :on :t :columns [:b]}]))
 
-(def ^:private stmt-prefix
-  "IF EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = 'pending_updates' AND ")
+(defn- run-migration-offline
+  "tern's own run-migration!, through SqlServerMigrator's migrate (version table
+  schema_versions), over fake-catalog: the connection is a stand-in that records
+  that it was opened, and each statement is recorded instead of executed.  Returns
+  {:connected? :executed :errors :exit}."
+  [indexes defaults commands]
+  (let [connected (atom false)
+        executed  (atom [])
+        errors    (atom [])
+        exit      (atom nil)]
+    (with-redefs-fn (merge (fake-catalog indexes defaults exit errors)
+                           {#'jdbc/get-connection          (fn [& _]
+                                                             (reset! connected true)
+                                                             (reify java.sql.Connection (close [_])))
+                            #'sqlserver/execute-statement! (fn [_ sql] (swap! executed conj sql))})
+      (fn []
+        (try
+          (tern-db/migrate (sqlserver/->SqlServerMigrator {:db db :version-table "schema_versions"})
+                           "20261015000000" commands)
+          (catch clojure.lang.ExceptionInfo e
+            (when-not (exit-thrown? e) (throw e))))))
+    {:connected? @connected :executed @executed :errors @errors :exit @exit}))
 
-;; Names that need quoting: in the predicate a T-SQL literal doubles a single quote; in the
-;; DROP the index is always bracketed, a ] doubled inside (as QUOTENAME does; a [ needs no
-;; escape), so a quote, a bracket or a space in the name is valid T-SQL.
-(expect [(str stmt-prefix "i.name = 'ix''q' AND c.name IN ('state', 'o''k')) DROP INDEX [ix'q] ON pending_updates")
-         (str stmt-prefix "i.name = 'ix]b' AND c.name IN ('state')) DROP INDEX [ix]]b] ON pending_updates")
-         (str stmt-prefix "i.name = 'IX sp' AND c.name IN ('state')) DROP INDEX [IX sp] ON pending_updates")]
-        [(#'sqlserver/drop-index-if-it-holds :pending_updates "ix'q" ["state" "o'k"])
-         (#'sqlserver/drop-index-if-it-holds :pending_updates "ix]b" ["state"])
-         (#'sqlserver/drop-index-if-it-holds :pending_updates "IX sp" ["state"])])
+(def ^:private a-in-two-indexes {["t" "a"] ["ix_a" "ix_a2"]})
+
+;; The refusal comes while the migration's SQL is generated, before its first statement runs.
+;; Through tern's own run-migration!, a migration that drops ix_a and then a, which ix_a2
+;; still contains, opens no connection and executes nothing, its first command's DROP INDEX
+;; included, so no version row is written; the same migration dropping both indexes first
+;; executes every statement and its version row.
+(expect [{:connected? false :executed [] :errors [(refusal "t" "a" "ix_a2")] :exit 1}
+         {:connected? true
+          :executed   ["DROP INDEX ix_a ON t"
+                       "DROP INDEX ix_a2 ON t"
+                       column-and-default
+                       "INSERT INTO schema_versions (version,created) VALUES (20261015000000,CURRENT_TIMESTAMP)"]
+          :errors     []
+          :exit       nil}]
+        [(run-migration-offline a-in-two-indexes t-a-default
+                                [{:drop-index :ix_a :on :t} (dropping :t :a)])
+         (run-migration-offline a-in-two-indexes t-a-default
+                                [{:drop-index :ix_a :on :t} {:drop-index :ix_a2 :on :t} (dropping :t :a)])])
 
 (def ^:private expected-indexes-sql
   "SELECT i.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = ? AND c.name = ? AND i.name IS NOT NULL AND i.is_primary_key = 0 AND i.is_unique_constraint = 0")
@@ -498,114 +660,6 @@
      (vec (#'sqlserver/get-column-defaults db "pending_updates" "state"))]))
 
 ;; Every row comes back, in order: a column in several indexes (pending_updates.state is
-;; in four) needs every one of them dropped.
+;; in four) has every one of them checked.
 (expect [["i1" "i2" "i3"] ["i1" "i2" "i3"]]
         (lookups-on-three-rows))
-
-(def ^:private two-indexes
-  {["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx" "pending_updates_other_idx"]})
-
-(def ^:private after-planned-drop
-  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_expires_at"])
-           (if-holds "pending_updates" "pending_updates_other_idx" ["lease_expires_at"])
-           "ALTER TABLE pending_updates DROP column lease_expires_at"]
-   :added [{:drop-index :pending_updates_other_idx :on :pending_updates}]})
-
-;; A :drop-index earlier in the migration changes nothing: it emits nothing when its guard
-;; misses the index, and whether the index still holds the column is decided when the
-;; statement runs.  The plan already holds the earlier entry, so only the other index is
-;; added to it.
-(expect after-planned-drop
-        (migrate-with-dependents [{:drop-index :pending_updates_lease_idx :on :pending_updates}]
-                                 two-indexes {} [(dropping :pending_updates :lease_expires_at)]))
-
-(def ^:private with-own-drop-index
-  {:sql   ["drop index if exists pending_updates_lease_idx on pending_updates"
-           (if-holds "pending_updates" "pending_updates_other_idx" ["lease_expires_at"])
-           "ALTER TABLE pending_updates DROP column lease_expires_at"]
-   :added [{:drop-index :pending_updates_other_idx :on :pending_updates}]})
-
-;; The command's own :drop-index key is always emitted, so its index is dropped once, by
-;; the key, and gets no statement from the dependent list.
-(expect with-own-drop-index
-        (migrate-with-dependents [] two-indexes {}
-                                 [(assoc (dropping :pending_updates :lease_expires_at)
-                                         :drop-index [:pending_updates_lease_idx])]))
-
-(def ^:private drop-then-create
-  [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_expires_at"])
-   "ALTER TABLE pending_updates DROP column lease_expires_at"
-   "CREATE  INDEX pending_updates_lease_idx ON pending_updates (state)"])
-
-;; A dependent index the generator drops is in the plan, so a :create-index of the same
-;; name later in the migration is emitted, not skipped because the catalog (read before
-;; anything runs) still lists it.
-(expect drop-then-create
-        (:sql (migrate-with-dependents [] xom-indexes {}
-                                       [(dropping :pending_updates :lease_expires_at)
-                                        {:create-index :pending_updates_lease_idx :on :pending_updates :columns [:state]}])))
-
-(def ^:private redefining-plan
-  [{:drop-index :pending_updates_lease_idx :on :pending_updates}
-   {:create-index :pending_updates_lease_idx :on :pending_updates :columns [:state]}])
-
-(def ^:private conditional-drop-only
-  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_expires_at"])
-           "ALTER TABLE pending_updates DROP column lease_expires_at"]
-   :added []})
-
-;; A migration that dropped the index and created it again gets the same conditional
-;; statement: at run time the new definition (on state) does not hold the column, so the
-;; index is left alone.  The plan already holds the drop, so nothing is added.
-(expect conditional-drop-only
-        (migrate-with-dependents redefining-plan xom-indexes {} [(dropping :pending_updates :lease_expires_at)]))
-
-(def ^:private conditional-drop-added
-  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_expires_at"])
-           "ALTER TABLE pending_updates DROP column lease_expires_at"]
-   :added [{:drop-index :pending_updates_lease_idx :on :pending_updates}]})
-
-;; A :create-index alone (its guard skips it while the index exists) gets the same
-;; statement, and the index's plan entry is added.
-(expect conditional-drop-added
-        (migrate-with-dependents [{:create-index :pending_updates_lease_idx :on :pending_updates :columns [:state]}]
-                                 xom-indexes {} [(dropping :pending_updates :lease_expires_at)]))
-
-(def ^:private shared-index
-  {["pending_updates" "lease_owner"]      ["pending_updates_lease_idx"]
-   ["pending_updates" "lease_expires_at"] ["pending_updates_lease_idx"]
-   ["pending_updates" "leased_at"]        ["pending_updates_lease_idx"]})
-
-(def ^:private shared-index-twice
-  {:sql   [(if-holds "pending_updates" "pending_updates_lease_idx" ["lease_owner" "lease_expires_at"])
-           "ALTER TABLE pending_updates DROP column lease_owner,lease_expires_at"
-           (if-holds "pending_updates" "pending_updates_lease_idx" ["leased_at"])
-           "ALTER TABLE pending_updates DROP column leased_at"]
-   :added [{:drop-index :pending_updates_lease_idx :on :pending_updates}]})
-
-;; An index on several dropped columns: one statement per command, its predicate on every
-;; column that command drops, and one plan entry for the whole migration.
-(expect shared-index-twice
-        (migrate-with-dependents [] shared-index {}
-                                 [(dropping :pending_updates :lease_owner :lease_expires_at)
-                                  (dropping :pending_updates :leased_at)]))
-
-(def ^:private reserved-table
-  [(if-holds "user" "user_x_idx" ["name"] "[user]")
-   "ALTER TABLE [user] DROP column name"])
-
-;; In the DROP a reserved-word table keeps the brackets to-sql-name gives it; in the
-;; predicate it is the catalog name.
-(expect reserved-table
-        (:sql (migrate-with-dependents [] {["user" "name"] ["user_x_idx"]} {} [(dropping :user :name)])))
-
-(def ^:private recreated-on-second
-  [(if-holds "t" "x_idx" ["a" "b"])
-   "ALTER TABLE t DROP column a,b"])
-
-;; The predicate lists every column the command drops, not only the one the catalog showed
-;; in the index when the SQL was generated: x_idx holds only a then, and if the migration
-;; re-creates it on b before this statement runs, it still holds a dropped column and is
-;; dropped, so the column drop does not meet 5074.
-(expect recreated-on-second
-        (:sql (migrate-with-dependents [] {["t" "a"] ["x_idx"]} {} [(dropping :t :a :b)])))
