@@ -626,6 +626,10 @@
 (expect (accepted-after "drop index ix_a on t")
         (after-override "drop index ix_a on t"))
 
+;; A nested vector is read at every depth, as run-migration! flattens it (tern.db/sql-statements).
+(expect (accepted-after "DROP INDEX ix_a ON t")
+        (after-override [["DROP INDEX ix_a ON t"]]))
+
 ;; An override that drops the index on another table, or drops another index, or only
 ;; mentions a drop of it inside a string literal, drops nothing here: still refused.
 (expect [(refused-after "DROP INDEX ix_a ON u")
@@ -634,6 +638,15 @@
         [(after-override ["DROP INDEX ix_a ON u"])
          (after-override ["DROP INDEX ix_b ON t"])
          (after-override ["INSERT INTO notes (body) VALUES ('drop index ix_a on t; done')"])])
+
+;; A statement counts only if it starts with DROP INDEX: a drop behind a condition that may
+;; not hold, or inside a comment, drops nothing here: still refused.
+(expect [(refused-after "IF 1 = 0 DROP INDEX ix_a ON t")
+         (refused-after "-- DROP INDEX ix_a ON t")
+         (refused-after "/* DROP INDEX ix_a ON t */")]
+        [(after-override ["IF 1 = 0 DROP INDEX ix_a ON t"])
+         (after-override ["-- DROP INDEX ix_a ON t"])
+         (after-override ["/* DROP INDEX ix_a ON t */"])])
 
 ;; A command with an override counts only by what its override drops, not by its structured
 ;; :drop-index, which does not run: an empty override, or one that drops nothing, leaves the
