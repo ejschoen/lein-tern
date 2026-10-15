@@ -10,9 +10,11 @@
   that answers only for the bound `*db*` and the exact table and column.  The
   create guard's reading of the plan is checked with the guard saying yes for the
   exact (db, table, index), the add-constraints guard's with the foreign-key
-  lookup saying yes for the exact (db, constraint), and the check-constraint
+  lookup saying yes for the exact (db, constraint), the create-table guard's with
+  the table lookup saying yes for the exact (db, table), and the check-constraint
   lookup by capturing the query it sends."
   (:require [tern.sqlserver    :as sqlserver]
+            [tern.db           :as tern-db]
             [clojure.java.jdbc :as jdbc]
             [expectations      :refer :all]))
 
@@ -144,16 +146,20 @@
         (create-after [{:drop-table :u}] :x))
 
 (defn- add-constraint-after
-  "generate-sql for an :alter-table of `table` adding the foreign key fk_x, *db*
-  bound, the lookup saying fk_x exists only for the bound db and \"fk_x\".
-  Returns [what an empty plan gives, what `plan` gives]: the first is empty only
-  if the lookup said yes."
-  [plan table]
-  (with-redefs [sqlserver/foreign-key-exists? (fn [d c] (= [d c] [db "fk_x"]))]
-    (vec (for [p [[] plan]]
-           (binding [sqlserver/*db*   db
-                     sqlserver/*plan* (atom p)]
-             (vec (sqlserver/generate-sql {:alter-table table :add-constraints [[:fk_x "(a) REFERENCES u(id)"]]})))))))
+  "generate-sql for an :alter-table of `table` adding the foreign keys `fks` (fk_x
+  unless given), each on (a) referencing u(id), *db* bound, the lookup saying yes
+  only for the bound db and the names in `existing`, as the generator must hand
+  them over (to-sql-name's; by default \"fk_x\").  Returns [what an empty plan
+  gives, what `plan` gives]: the first is empty only if the lookup said yes for
+  each of `fks`."
+  ([plan table] (add-constraint-after plan table [:fk_x] #{"fk_x"}))
+  ([plan table fks existing]
+   (with-redefs [sqlserver/foreign-key-exists? (fn [d c] (and (= d db) (contains? existing c)))]
+     (vec (for [p [[] plan]]
+            (binding [sqlserver/*db*   db
+                      sqlserver/*plan* (atom p)]
+              (vec (sqlserver/generate-sql {:alter-table     table
+                                            :add-constraints (vec (for [fk fks] [fk "(a) REFERENCES u(id)"]))}))))))))
 
 ;; :add-constraints follows the same rule: a foreign key the catalog shows is added again
 ;; after an earlier :drop-constraints of it on the table (the table compared as a catalog
@@ -167,6 +173,41 @@
          (add-constraint-after [{:drop-table :t}] :t)
          (add-constraint-after [{:alter-table :u :drop-constraints [:fk_x]}] :t)
          (add-constraint-after [{:drop-table :u}] :t)])
+
+;; Every constraint in a :drop-constraints vector counts, not only the first: both foreign
+;; keys are added again.
+(expect [[] ["ALTER TABLE t ADD CONSTRAINT fk_a FOREIGN KEY (a) REFERENCES u(id),CONSTRAINT fk_b FOREIGN KEY (a) REFERENCES u(id)"]]
+        (add-constraint-after [{:alter-table :t :drop-constraints [:fk_a :fk_b]}] :t [:fk_a :fk_b] #{"fk_a" "fk_b"}))
+
+;; A kebab-case constraint name is the catalog name of its snake_case spelling, on either
+;; side: dropped as :fk-x and added as :fk_x, or dropped as :fk_x and added as :fk-x.
+(expect [[[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]]
+        [(add-constraint-after [{:alter-table :t :drop-constraints [:fk-x]}] :t)
+         (add-constraint-after [{:alter-table :t :drop-constraints [:fk_x]}] :t [:fk-x] #{"fk_x"})])
+
+;; A reserved-word table: the plan's drop on :user is compared as the catalog name user;
+;; the lookup is handed only the constraint, and the statement brackets the table.
+(expect [[] ["ALTER TABLE [user] ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+        (add-constraint-after [{:alter-table :user :drop-constraints [:fk_x]}] :user))
+
+(defn- create-table-after
+  "generate-sql for a :create-table of :t (column a INT), *db* bound, the lookup
+  saying the table exists only for the bound db and \"t\".  Returns [what an empty
+  plan gives, what `plan` gives]: the first is nil only if the lookup said yes."
+  [plan]
+  (with-redefs [sqlserver/table-exists? (fn [d t] (= [d t] [db "t"]))]
+    (vec (for [p [[] plan]]
+           (binding [sqlserver/*db*   db
+                     sqlserver/*plan* (atom p)]
+             (sqlserver/generate-sql {:create-table :t :columns [[:a "INT"]]}))))))
+
+;; :create-table reads the plan's drops the same way: after a :drop-table that names the
+;; table as a string, or carries a :sqlserver override, CREATE TABLE is emitted though the
+;; catalog still shows the table.
+(expect [[nil ["CREATE TABLE t (a INT)"]] [nil ["CREATE TABLE t (a INT)"]]]
+        [(create-table-after [{:drop-table "t"}])
+         (create-table-after [{:drop-table :t :sqlserver "DROP TABLE t"}])])
 
 (def ^:private chathistory-up
   "i2kdb 20250427121101-chathistory_conversations.edn's :up: the table is dropped and
@@ -191,23 +232,33 @@
    {:create-index :chathistory_created :on :chathistory :columns [:created]}
    {:create-index :chathistory_updated :on :chathistory :columns [:updated]}])
 
-(defn- migrate-over-old-table
-  "Runs `commands` through generate-sql as run-migration! does (*db* bound, one
-  plan, each command appended after its SQL is generated) against a catalog, read
-  before anything runs, in which `table` exists with every index and foreign key
-  asked about; each lookup answers only for the bound *db*.  Returns the statements."
-  [table commands]
-  (with-redefs [sqlserver/table-exists?       (fn [d t] (= [d t] [db table]))
-                sqlserver/index-exists?       (fn [d t _] (= [d t] [db table]))
-                sqlserver/foreign-key-exists? (fn [d _] (= d db))]
+(defn- migrate-over-catalog
+  "Runs `commands` as run-migration! does: *db* bound, one plan, each command's
+  statements its :sqlserver override or what generate-sql gives (flattened by
+  tern.db/sql-statements), the command appended to the plan after them.  The
+  catalog, read before anything runs, answers with `tables`, `columns`, `indexes`
+  and `fks`, each a set (or predicate) of what the generator hands the lookup: a
+  table, [table column], [table index], a constraint; each lookup answers only for
+  the bound *db*.  Returns the statements."
+  [{:keys [tables columns indexes fks] :or {tables #{} columns #{} indexes #{} fks #{}}} commands]
+  (with-redefs [sqlserver/table-exists?       (fn [d t] (boolean (and (= d db) (tables t))))
+                sqlserver/column-exists?      (fn [d t c] (boolean (and (= d db) (columns [t c]))))
+                sqlserver/index-exists?       (fn [d t i] (boolean (and (= d db) (indexes [t i]))))
+                sqlserver/foreign-key-exists? (fn [d c] (boolean (and (= d db) (fks c))))]
     (binding [sqlserver/*db*   db
               sqlserver/*plan* (atom [])]
       (reduce (fn [acc command]
-                (let [sql (doall (sqlserver/generate-sql command))]
+                (let [sql (doall (tern-db/sql-statements (or (:sqlserver command) (sqlserver/generate-sql command))))]
                   (swap! sqlserver/*plan* concat [command])
                   (into acc sql)))
               []
               commands))))
+
+(defn- migrate-over-old-table
+  "migrate-over-catalog against a catalog in which `table` exists with every index
+  and foreign key asked about."
+  [table commands]
+  (migrate-over-catalog {:tables #{table} :indexes (fn [[t _]] (= t table)) :fks (constantly true)} commands))
 
 ;; The real shape: chathistory dropped and created again gets back both foreign keys and
 ;; all five indexes, though the catalog the SQL is generated against still shows them all.
@@ -220,6 +271,53 @@
          "CREATE  INDEX chathistory_created ON chathistory (created)"
          "CREATE  INDEX chathistory_updated ON chathistory (updated)"]
         (migrate-over-old-table "chathistory" chathistory-up))
+
+(def ^:private feedback-up
+  "i2kdb 20190509100957-denormalize-feedback-client-and-user.edn's :up: one
+  :drop-constraints drops both of feedback's foreign keys, which a later
+  :add-constraints adds again."
+  [{:alter-table :feedback
+    :add-columns [[:client "VARCHAR(255)" "NULL"]
+                  [:user "VARCHAR(255)" "NULL"]]
+    :modify-columns [[:users_id "INT(11)" "NULL"]]
+    :drop-constraints [:fk_feedback_clients_id :fk_feedback_users_id]}
+   {:update "update feedback,clients set feedback.client=clients.name where feedback.clients_id=clients.id"
+    :h2 "update feedback set client=(select name from clients where feedback.clients_id=clients.id)"
+    :sqlserver "update feedback set client=(select name from clients where feedback.clients_id=clients.id)"}
+   {:update "update feedback,users set feedback.user=users.name where feedback.users_id=users.id"
+    :h2 "update feedback set `user`=(select name from users where feedback.users_id=users.id)"
+    :sqlserver "update feedback set [user]=(select name from users where feedback.users_id=users.id)"}
+   {:alter-table :feedback
+    :add-constraints [[:fk_feedback_clients_id "(clients_id) REFERENCES clients(id) ON DELETE SET NULL"]
+                      [:fk_feedback_users_id "(users_id) REFERENCES users(id) ON DELETE SET NULL"]]
+    :modify-columns [[:client "VARCHAR(255)" "NOT NULL"]
+                     [:user "VARCHAR(255)" "NOT NULL"]]}
+   {:alter-table :users
+    :drop-constraints [:fk_users_clients_id]}
+   {:alter-table :users
+    :add-constraints [[:fk_users_clients_id "(clients_id) REFERENCES clients(id) ON DELETE CASCADE"]]
+    :sqlserver ["alter table users add constraint fk_users_clients_id foreign key (clients_id) references clients(id)"
+                "create or alter trigger delete_client on clients instead of delete as begin set nocount on; delete from users where clients_id in (select id from deleted); delete from clients where id in (select id from deleted); end"]}
+   {:create-index :feedback_client_idx :on :feedback :columns [:client]}])
+
+;; The real shape: both of feedback's foreign keys are added again, in one statement, though
+;; the catalog the SQL is generated against still shows them; the overrides run as written.
+(expect ["ALTER TABLE feedback ALTER COLUMN users_id int NULL"
+         "ALTER TABLE feedback DROP constraint if exists fk_feedback_clients_id,fk_feedback_users_id"
+         "ALTER TABLE feedback ADD client VARCHAR(255) NULL,[user] VARCHAR(255) NULL"
+         "update feedback set client=(select name from clients where feedback.clients_id=clients.id)"
+         "update feedback set [user]=(select name from users where feedback.users_id=users.id)"
+         "ALTER TABLE feedback ALTER COLUMN client VARCHAR(255) NOT NULL"
+         "ALTER TABLE feedback ALTER COLUMN [user] VARCHAR(255) NOT NULL"
+         "ALTER TABLE feedback ADD CONSTRAINT fk_feedback_clients_id FOREIGN KEY (clients_id) REFERENCES clients(id) ON DELETE SET NULL,CONSTRAINT fk_feedback_users_id FOREIGN KEY (users_id) REFERENCES users(id) ON DELETE SET NULL"
+         "ALTER TABLE users DROP constraint if exists fk_users_clients_id"
+         "alter table users add constraint fk_users_clients_id foreign key (clients_id) references clients(id)"
+         "create or alter trigger delete_client on clients instead of delete as begin set nocount on; delete from users where clients_id in (select id from deleted); delete from clients where id in (select id from deleted); end"
+         "CREATE  INDEX feedback_client_idx ON feedback (client)"]
+        (migrate-over-catalog {:tables  #{"feedback" "users" "clients"}
+                               :columns #{["feedback" "clients_id"] ["feedback" "users_id"]}
+                               :fks     #{"fk_feedback_clients_id" "fk_feedback_users_id" "fk_users_clients_id"}}
+                              feedback-up))
 
 ;; ---------------------------------------------------------------------------
 ;; :drop-columns drops what depends on the column first: SQL Server refuses to

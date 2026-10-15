@@ -7,7 +7,7 @@
            [java.sql Connection PreparedStatement Statement Timestamp]))
 
 (declare primary-key-exists? get-primary-key foreign-key-exists? index-exists? column-exists? table-exists? get-column-constraints
-         get-column-indexes get-column-defaults)
+         get-column-indexes get-column-defaults catalog-name plan-dropped-tables)
 
 (def ^:dynamic *db* nil)
 (def ^:dynamic *plan* nil)
@@ -125,7 +125,7 @@
         pk (generate-pk command)]
     (if (and *db*
              (table-exists? *db* (to-sql-name table :quote-for-statement false))
-             (not (some (fn [prior] (= prior {:drop-table table})) @*plan*)))
+             (not (contains? (plan-dropped-tables @*plan*) (catalog-name table))))
       (do (log/info (format "  * Skipping CREATE TABLE %s because it already exists." (to-sql-name table)))
           nil)
       (if (not-empty table-spec)
