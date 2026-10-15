@@ -157,17 +157,49 @@
   [k]
   (to-sql-name k :quote-for-statement false))
 
+(def ^:private drop-index-statement
+  "One whole T-SQL statement `DROP INDEX [IF EXISTS] <index> ON <table>`: keywords
+  in any case, any whitespace, each name bare, [bracketed] or \"double-quoted\",
+  the table possibly qualified (only its last segment is captured), an optional
+  trailing semicolon.  Group 1 is the index, group 2 the table."
+  #"(?i)\s*DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\".;,]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,]+)\s*;?\s*")
+
+(defn- unquoted-identifier
+  "`s` without the [brackets] or \"double quotes\" that delimit it, if any."
+  [s]
+  (if (or (and (s/starts-with? s "[") (s/ends-with? s "]"))
+          (and (s/starts-with? s "\"") (s/ends-with? s "\"")))
+    (subs s 1 (dec (count s)))
+    s))
+
+(defn- override-dropped-indexes
+  "The [table index] pairs, as catalog names, that the statements of a
+  `:sqlserver` override drop: each string in it (a string, or a vector of strings
+  at any depth, as run-migration! reads it) that is one DROP INDEX ... ON ...
+  statement.  Any other statement, or a DROP INDEX naming no table, drops nothing
+  here."
+  [override]
+  (for [statement (tree-seq sequential? seq override)
+        :when (string? statement)
+        :let [[_ index table] (re-matches drop-index-statement statement)]
+        :when index]
+    [(catalog-name (unquoted-identifier table)) (catalog-name (unquoted-identifier index))]))
+
 (defn- plan-dropped-indexes
   "The [table index] pairs, as catalog names, that the commands in `plan` drop:
   a `{:drop-index i :on t}` command, or the `:drop-index` key of an `:alter-table`.
-  A `:drop-index` command without `:on` names no table and is left out."
+  A `:drop-index` command without `:on` names no table and is left out.  A command
+  with a `:sqlserver` override runs the override instead, as run-migration! does,
+  so it counts only by the DROP INDEX statements the override holds."
   [plan]
   (set (mapcat (fn [command]
-                 (let [index (:drop-index command)]
-                   (cond (nil? index) nil
-                         (:alter-table command) (for [i (if (coll? index) index [index])]
-                                                  [(catalog-name (:alter-table command)) (catalog-name i)])
-                         (:on command) [[(catalog-name (:on command)) (catalog-name index)]])))
+                 (if-let [override (:sqlserver command)]
+                   (override-dropped-indexes override)
+                   (let [index (:drop-index command)]
+                     (cond (nil? index) nil
+                           (:alter-table command) (for [i (if (coll? index) index [index])]
+                                                    [(catalog-name (:alter-table command)) (catalog-name i)])
+                           (:on command) [[(catalog-name (:on command)) (catalog-name index)]]))))
                plan)))
 
 (defn- plan-dropped-constraints
@@ -205,9 +237,11 @@
   them that the migration does not drop first, this stops the migration before
   any of its statements runs: one error line per column and index, then the
   exit, as tern's other refusals do.  An index counts as dropped first when an
-  earlier {:drop-index i :on table} command or :alter-table :drop-index key, or
-  this command's own :drop-index key (`own-drops`), names it, compared as catalog
-  names, or when an earlier {:drop-table table} drops the whole table.  Indexes
+  earlier {:drop-index i :on table} command or :alter-table :drop-index key, an
+  earlier :sqlserver override's DROP INDEX ... ON table statement, or this
+  command's own :drop-index key (`own-drops`) names it, compared as catalog names
+  (plan-dropped-indexes), or when an earlier {:drop-table table} drops the whole
+  table.  Indexes
   that back a primary key or a unique constraint are not looked up here: they are
   constraints, dropped before the column with its other constraints."
   [table columns own-drops]

@@ -10,9 +10,10 @@
   that answers only for the bound `*db*` and the exact table and column, and its
   refusal of an index that still contains a dropped column is checked by trapping
   tern's exit (`tern.sqlserver/exit!`, replaced by a stub that records the status
-  and throws, as System/exit never returns) and capturing `tern.log/error`; one
-  case runs tern's own run-migration! with the connection and the executor
-  replaced, to show the refusal comes before the first statement.  The
+  and throws, as System/exit never returns) and capturing `tern.log/error`; two
+  cases run tern's own run-migration! with the connection and the executor
+  replaced, to show the refusal comes before the first statement, and a set of
+  cases has an earlier command's :sqlserver override drop the index.  The
   create guard's reading of the plan is checked with the guard saying yes for the
   exact (db, table, index), the add-constraints guard's with the foreign-key
   lookup saying yes for the exact (db, constraint), the create-table guard's with
@@ -364,11 +365,12 @@
   (contains? (ex-data e) ::exit))
 
 (defn- migrate-with-dependents
-  "Runs `commands` through generate-sql as run-migration! does, over fake-catalog:
-  *db* bound, one plan atom starting at `plan`, each command appended to the plan
-  after its SQL is generated; a requested exit ends the run there.  Returns {:sql the
-  statements generated before any exit, :errors the lines tern logged as errors,
-  :exit the status of the requested exit, or nil}."
+  "Runs `commands` as run-migration! does, over fake-catalog: *db* bound, one plan
+  atom starting at `plan`, each command's statements its :sqlserver override or
+  what generate-sql gives (flattened by tern.db/sql-statements), the command
+  appended to the plan after them; a requested exit ends the run there.  Returns
+  {:sql the statements generated before any exit, :errors the lines tern logged as
+  errors, :exit the status of the requested exit, or nil}."
   [plan indexes defaults commands]
   (let [sql    (atom [])
         errors (atom [])
@@ -379,7 +381,8 @@
                   sqlserver/*plan* (atom plan)]
           (try
             (doseq [command commands]
-              (let [statements (doall (sqlserver/generate-sql command))]
+              (let [statements (doall (tern-db/sql-statements (or (:sqlserver command)
+                                                                  (sqlserver/generate-sql command))))]
                 (swap! sqlserver/*plan* concat [command])
                 (swap! sql into statements)))
             (catch clojure.lang.ExceptionInfo e
@@ -453,6 +456,12 @@
                                    [[{:drop-index "my_idx" :on "my_table"}] (dropping :my-table :my_col)]
                                    [[] (assoc (dropping :my_table :my_col) :drop-index [:my-idx])]]]
                (migrate-with-dependents plan {["my_table" "my_col"] ["my_idx"]} {} [command]))))
+
+;; Refused, the line names a kebab-spelled table and column as the catalog holds them.
+(expect {:sql    []
+         :errors ["tern: cannot drop column my_table.my_col on SQL Server: index my_idx still contains it; drop the index first in this migration (:drop-index), or remove a stale index by hand (see the SQL Server migration runbook, section 5a)"]
+         :exit   1}
+        (migrate-with-dependents [] {["my_table" "my_col"] ["my_idx"]} {} [(dropping :my-table :my-col)]))
 
 (def ^:private user-index {["user" "name"] ["user_x_idx"]})
 
@@ -559,6 +568,107 @@
                                 [{:drop-index :ix_a :on :t} (dropping :t :a)])
          (run-migration-offline a-in-two-indexes t-a-default
                                 [{:drop-index :ix_a :on :t} {:drop-index :ix_a2 :on :t} (dropping :t :a)])])
+
+;; Only a drop earlier in the migration counts: one after the column drop comes too late,
+;; so the column drop is refused and nothing of the migration runs.
+(expect {:connected? false :executed [] :errors [(refusal "t" "a" "ix_a")] :exit 1}
+        (run-migration-offline t-a-index t-a-default [(dropping :t :a) {:drop-index :ix_a :on :t}]))
+
+;; ---------------------------------------------------------------------------
+;; An earlier command with a :sqlserver override runs the override instead of its
+;; structured form, so it counts as dropping an index exactly when one of the override's
+;; statements is DROP INDEX [IF EXISTS] <index> ON <table>.
+
+(defn- overriding
+  "A command whose structured form drops nothing, with `sql` as its :sqlserver override."
+  [sql]
+  {:update "UPDATE t SET a = a WHERE 1 = 0" :sqlserver sql})
+
+(defn- accepted-after
+  "The outcome of an earlier command's `statements` followed by an accepted drop of
+  t.a (ix_a, DF_t_a): those statements, then the column with its default."
+  [& statements]
+  {:sql (conj (vec statements) column-and-default) :errors [] :exit nil})
+
+(defn- refused-after
+  "The outcome of an earlier command's `statements` followed by a refused drop of t.a."
+  [& statements]
+  {:sql (vec statements) :errors [(refusal "t" "a" "ix_a")] :exit 1})
+
+(defn- after-override
+  [sql]
+  (migrate-with-dependents [] t-a-index t-a-default [(overriding sql) (dropping :t :a)]))
+
+;; tern's own lowercase form in a vector counts ...
+(expect (accepted-after "drop index if exists ix_a on t")
+        (after-override ["drop index if exists ix_a on t"]))
+
+;; ... and so does the upper-case form ...
+(expect (accepted-after "DROP INDEX ix_a ON t")
+        (after-override ["DROP INDEX ix_a ON t"]))
+
+;; ... with names bracketed or double-quoted, a schema-qualified table (its last segment
+;; is the table), keywords in mixed case, other whitespace and a closing semicolon.
+(expect [(accepted-after "DROP INDEX [ix_a] ON [t]")
+         (accepted-after "DROP INDEX ix_a ON dbo.t")
+         (accepted-after "DROP INDEX \"ix_a\" ON [dbo].[t]")
+         (accepted-after "Drop Index If Exists ix_a\n\tOn t;")]
+        [(after-override ["DROP INDEX [ix_a] ON [t]"])
+         (after-override ["DROP INDEX ix_a ON dbo.t"])
+         (after-override ["DROP INDEX \"ix_a\" ON [dbo].[t]"])
+         (after-override ["Drop Index If Exists ix_a\n\tOn t;"])])
+
+;; Every statement of a vector override is read, not only the first ...
+(expect (accepted-after "UPDATE t SET a = NULL WHERE 1 = 0" "DROP INDEX ix_a ON t")
+        (after-override ["UPDATE t SET a = NULL WHERE 1 = 0" "DROP INDEX ix_a ON t"]))
+
+;; ... and an override given as a string is read as one statement.
+(expect (accepted-after "drop index ix_a on t")
+        (after-override "drop index ix_a on t"))
+
+;; An override that drops the index on another table, or drops another index, or only
+;; mentions a drop of it inside a string literal, drops nothing here: still refused.
+(expect [(refused-after "DROP INDEX ix_a ON u")
+         (refused-after "DROP INDEX ix_b ON t")
+         (refused-after "INSERT INTO notes (body) VALUES ('drop index ix_a on t; done')")]
+        [(after-override ["DROP INDEX ix_a ON u"])
+         (after-override ["DROP INDEX ix_b ON t"])
+         (after-override ["INSERT INTO notes (body) VALUES ('drop index ix_a on t; done')"])])
+
+;; A command with an override counts only by what its override drops, not by its structured
+;; :drop-index, which does not run: an empty override, or one that drops nothing, leaves the
+;; refusal.
+(expect {:sql [] :errors [(refusal "t" "a" "ix_a")] :exit 1}
+        (migrate-with-dependents [] t-a-index t-a-default
+                                 [{:drop-index :ix_a :on :t :sqlserver []} (dropping :t :a)]))
+
+(expect {:sql ["UPDATE t SET a = a WHERE 1 = 0"] :errors [(refusal "t" "a" "ix_a")] :exit 1}
+        (migrate-with-dependents [] t-a-index t-a-default
+                                 [{:drop-index :ix_a :on :t :sqlserver ["UPDATE t SET a = a WHERE 1 = 0"]}
+                                  (dropping :t :a)]))
+
+;; The create guard reads the same drops: after an override that drops ix_a, a structured
+;; :create-index of ix_a is emitted though the catalog still shows it; after one that drops
+;; another index it is skipped.
+(expect [{:sql ["DROP INDEX ix_a ON t" "CREATE  INDEX ix_a ON t (b)"] :errors [] :exit nil}
+         {:sql ["DROP INDEX ix_b ON t"] :errors [] :exit nil}]
+        [(migrate-with-dependents [] t-a-index {} [(overriding "DROP INDEX ix_a ON t")
+                                                   {:create-index :ix_a :on :t :columns [:b]}])
+         (migrate-with-dependents [] t-a-index {} [(overriding "DROP INDEX ix_b ON t")
+                                                   {:create-index :ix_a :on :t :columns [:b]}])])
+
+;; The real shape (i2kdb 20160607135101): the index is dropped by the override under its
+;; SQL Server name, while the structured :drop-index names MySQL's; the column drop is
+;; accepted, the override's statement first.
+(expect {:sql    ["drop index if exists idx_taxnodes_config_client_key on taxnodes_config"
+                  "ALTER TABLE taxnodes_config DROP column clients_id"]
+         :errors []
+         :exit   nil}
+        (migrate-with-dependents [] {["taxnodes_config" "clients_id"] ["idx_taxnodes_config_client_key"]} {}
+                                 [{:drop-index :idx_taxnodes_config_client_path_key :on :taxnodes_config
+                                   :sqlserver ["drop index if exists idx_taxnodes_config_client_key on taxnodes_config"]}
+                                  {:alter-table :taxnodes_config
+                                   :drop-columns [:clients_id]}]))
 
 (def ^:private expected-indexes-sql
   "SELECT i.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = ? AND c.name = ? AND i.name IS NOT NULL AND i.is_primary_key = 0 AND i.is_unique_constraint = 0")
