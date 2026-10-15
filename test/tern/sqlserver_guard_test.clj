@@ -9,8 +9,9 @@
   dependent-index and default-constraint lookups are replaced by a fake catalog
   that answers only for the bound `*db*` and the exact table and column.  The
   create guard's reading of the plan is checked with the guard saying yes for the
-  exact (db, table, index), and the check-constraint lookup by capturing the
-  query it sends."
+  exact (db, table, index), the add-constraints guard's with the foreign-key
+  lookup saying yes for the exact (db, constraint), and the check-constraint
+  lookup by capturing the query it sends."
   (:require [tern.sqlserver    :as sqlserver]
             [clojure.java.jdbc :as jdbc]
             [expectations      :refer :all]))
@@ -67,21 +68,25 @@
 
 ;; ---------------------------------------------------------------------------
 ;; While the guard finds the index, CREATE INDEX is still emitted when an earlier command
-;; in the migration drops it: a {:drop-index i :on t} command or an :alter-table's
-;; :drop-index key, the table and index compared as catalog names.
+;; in the migration drops it: a {:drop-index i :on t} command, an :alter-table's
+;; :drop-index key or a :drop-table of the table, the table and index compared as
+;; catalog names.
 
 (defn- create-after
-  "generate-sql for a :create-index of `index` (a snake_case keyword, its name the
-  catalog name) on :t, *db* bound, the guard saying yes only for the bound db,
-  table \"t\" and that index, the arguments the generator must pass.  Returns
-  [what an empty plan gives, what `plan` gives]: the first is nil only if the
-  guard said yes, so the second emitting the CREATE is the plan's doing."
-  [plan index]
-  (with-redefs [sqlserver/index-exists? (fn [d t i] (= [d t i] [db "t" (name index)]))]
-    (vec (for [p [[] plan]]
-           (binding [sqlserver/*db*   db
-                     sqlserver/*plan* (atom p)]
-             (sqlserver/generate-sql {:create-index index :on :t :columns [:a]}))))))
+  "generate-sql for a :create-index of `index` on `table` (:t unless given), *db*
+  bound, the guard saying yes only for the bound db and `guard`, the [table index]
+  strings the generator must hand it: to-sql-name's, so a reserved-word table
+  arrives bracketed (\"[user]\") and a kebab-case name in snake_case; by default
+  \"t\" and the name of `index`, a snake_case keyword.  Returns [what an empty plan
+  gives, what `plan` gives]: the first is nil only if the guard said yes, so the
+  second emitting the CREATE is the plan's doing."
+  ([plan index] (create-after plan :t index ["t" (name index)]))
+  ([plan table index guard]
+   (with-redefs [sqlserver/index-exists? (fn [d t i] (= [d t i] (into [db] guard)))]
+     (vec (for [p [[] plan]]
+            (binding [sqlserver/*db*   db
+                      sqlserver/*plan* (atom p)]
+              (sqlserver/generate-sql {:create-index index :on table :columns [:a]})))))))
 
 ;; An :alter-table's :drop-index key (a vector, no :on) counts as a drop of each index on
 ;; that table.
@@ -102,6 +107,119 @@
         [(create-after [{:drop-index :x :on :u}] :x)
          (create-after [{:alter-table :u :drop-index [:x]}] :x)
          (create-after [{:drop-index :x}] :x)])
+
+;; Every index in an :alter-table's :drop-index vector counts, not only the first.
+(expect [nil ["CREATE  INDEX x ON t (a)"]]
+        (create-after [{:alter-table :t :drop-index [:y :x]}] :x))
+
+;; So does every index in a set, which the :alter-table generator accepts too.
+(expect [nil ["CREATE  INDEX x ON t (a)"]]
+        (create-after [{:alter-table :t :drop-index #{:x}}] :x))
+
+;; A kebab-case table, in either drop form, is the catalog table the snake_case create
+;; names.
+(expect [[nil ["CREATE  INDEX x ON my_table (a)"]] [nil ["CREATE  INDEX x ON my_table (a)"]]]
+        [(create-after [{:drop-index :x :on :my-table}] :my_table :x ["my_table" "x"])
+         (create-after [{:alter-table :my-table :drop-index [:x]}] :my_table :x ["my_table" "x"])])
+
+;; A kebab-case create is the catalog index a snake_case drop names.
+(expect [nil ["CREATE  INDEX my_idx ON t (a)"]]
+        (create-after [{:drop-index :my_idx :on :t}] :t :my-idx ["t" "my_idx"]))
+
+;; A reserved-word table reaches the guard bracketed, as OBJECT_ID needs it, while the
+;; plan's drops of it, in either form, are compared as the catalog name user.
+(expect [[nil ["CREATE  INDEX x ON [user] (a)"]] [nil ["CREATE  INDEX x ON [user] (a)"]]]
+        [(create-after [{:drop-index :x :on :user}] :user :x ["[user]" "x"])
+         (create-after [{:alter-table :user :drop-index [:x]}] :user :x ["[user]" "x"])])
+
+;; Dropping a table drops its indexes: after a :drop-table of the table (kebab or snake
+;; case) the create is emitted, though the catalog, read before anything runs, still
+;; shows the old table's index ...
+(expect [[nil ["CREATE  INDEX x ON t (a)"]] [nil ["CREATE  INDEX x ON my_table (a)"]]]
+        [(create-after [{:drop-table :t}] :x)
+         (create-after [{:drop-table :my-table}] :my_table :x ["my_table" "x"])])
+
+;; ... and a :drop-table of another table leaves it skipped.
+(expect [nil nil]
+        (create-after [{:drop-table :u}] :x))
+
+(defn- add-constraint-after
+  "generate-sql for an :alter-table of `table` adding the foreign key fk_x, *db*
+  bound, the lookup saying fk_x exists only for the bound db and \"fk_x\".
+  Returns [what an empty plan gives, what `plan` gives]: the first is empty only
+  if the lookup said yes."
+  [plan table]
+  (with-redefs [sqlserver/foreign-key-exists? (fn [d c] (= [d c] [db "fk_x"]))]
+    (vec (for [p [[] plan]]
+           (binding [sqlserver/*db*   db
+                     sqlserver/*plan* (atom p)]
+             (vec (sqlserver/generate-sql {:alter-table table :add-constraints [[:fk_x "(a) REFERENCES u(id)"]]})))))))
+
+;; :add-constraints follows the same rule: a foreign key the catalog shows is added again
+;; after an earlier :drop-constraints of it on the table (the table compared as a catalog
+;; name, so :my-t is :my_t) or a :drop-table of the table, and not after either on
+;; another table.
+(expect [[[] ["ALTER TABLE my_t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+         [[] []]
+         [[] []]]
+        [(add-constraint-after [{:alter-table :my-t :drop-constraints [:fk_x]}] :my_t)
+         (add-constraint-after [{:drop-table :t}] :t)
+         (add-constraint-after [{:alter-table :u :drop-constraints [:fk_x]}] :t)
+         (add-constraint-after [{:drop-table :u}] :t)])
+
+(def ^:private chathistory-up
+  "i2kdb 20250427121101-chathistory_conversations.edn's :up: the table is dropped and
+  created again with two foreign keys and five indexes; 20240622220001 had created
+  the indexes chathistory_clients_id, chathistory_users_id and chathistory_created
+  under the same names."
+  [{:drop-table :chathistory}
+   {:create-table :chathistory
+    :columns [[:clients_id "INT" "NOT NULL"]
+              [:users_id "INT" "NOT NULL"]
+              [:conversation_id "VARCHAR(36)" "NOT NULL"]
+              [:metadata_json "LONGTEXT" "COLLATE utf8_general_ci" "NOT NULL"]
+              [:messages_json "LONGTEXT" "COLLATE utf8_general_ci" "NOT NULL"]
+              [:created "TIMESTAMP" "NOT NULL" "DEFAULT CURRENT_TIMESTAMP"]
+              [:updated "TIMESTAMP" "NOT NULL" "DEFAULT CURRENT_TIMESTAMP"]]}
+   {:alter-table :chathistory
+    :add-constraints [[:fk_chathistory_clients "(clients_id) REFERENCES clients(id) ON DELETE CASCADE"]
+                      [:fk_chathistory_users "(users_id) REFERENCES users(id) ON DELETE CASCADE"]]}
+   {:create-index :chathistory_clients_id :on :chathistory :columns [:clients_id]}
+   {:create-index :chathistory_users_id :on :chathistory :columns [:users_id]}
+   {:create-index :chathistory_conversation_id :on :chathistory :columns [:clients_id :users_id :conversation_id]}
+   {:create-index :chathistory_created :on :chathistory :columns [:created]}
+   {:create-index :chathistory_updated :on :chathistory :columns [:updated]}])
+
+(defn- migrate-over-old-table
+  "Runs `commands` through generate-sql as run-migration! does (*db* bound, one
+  plan, each command appended after its SQL is generated) against a catalog, read
+  before anything runs, in which `table` exists with every index and foreign key
+  asked about; each lookup answers only for the bound *db*.  Returns the statements."
+  [table commands]
+  (with-redefs [sqlserver/table-exists?       (fn [d t] (= [d t] [db table]))
+                sqlserver/index-exists?       (fn [d t _] (= [d t] [db table]))
+                sqlserver/foreign-key-exists? (fn [d _] (= d db))]
+    (binding [sqlserver/*db*   db
+              sqlserver/*plan* (atom [])]
+      (reduce (fn [acc command]
+                (let [sql (doall (sqlserver/generate-sql command))]
+                  (swap! sqlserver/*plan* concat [command])
+                  (into acc sql)))
+              []
+              commands))))
+
+;; The real shape: chathistory dropped and created again gets back both foreign keys and
+;; all five indexes, though the catalog the SQL is generated against still shows them all.
+(expect ["DROP TABLE chathistory"
+         "CREATE TABLE chathistory (clients_id INT NOT NULL, users_id INT NOT NULL, conversation_id VARCHAR(36) NOT NULL, metadata_json varchar(max)  NOT NULL, messages_json varchar(max)  NOT NULL, created datetime NOT NULL DEFAULT CURRENT_TIMESTAMP, updated datetime NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+         "ALTER TABLE chathistory ADD CONSTRAINT fk_chathistory_clients FOREIGN KEY (clients_id) REFERENCES clients(id) ON DELETE CASCADE,CONSTRAINT fk_chathistory_users FOREIGN KEY (users_id) REFERENCES users(id) ON DELETE CASCADE"
+         "CREATE  INDEX chathistory_clients_id ON chathistory (clients_id)"
+         "CREATE  INDEX chathistory_users_id ON chathistory (users_id)"
+         "CREATE  INDEX chathistory_conversation_id ON chathistory (clients_id, users_id, conversation_id)"
+         "CREATE  INDEX chathistory_created ON chathistory (created)"
+         "CREATE  INDEX chathistory_updated ON chathistory (updated)"]
+        (migrate-over-old-table "chathistory" chathistory-up))
 
 ;; ---------------------------------------------------------------------------
 ;; :drop-columns drops what depends on the column first: SQL Server refuses to

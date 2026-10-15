@@ -165,10 +165,32 @@
   (set (mapcat (fn [command]
                  (let [index (:drop-index command)]
                    (cond (nil? index) nil
-                         (:alter-table command) (for [i (if (sequential? index) index [index])]
+                         (:alter-table command) (for [i (if (coll? index) index [index])]
                                                   [(catalog-name (:alter-table command)) (catalog-name i)])
                          (:on command) [[(catalog-name (:on command)) (catalog-name index)]])))
                plan)))
+
+(defn- plan-dropped-constraints
+  "The [table constraint] pairs, as catalog names, that the `:drop-constraints`
+  keys of the `:alter-table` commands in `plan` drop."
+  [plan]
+  (set (for [command plan
+             :let [table       (:alter-table command)
+                   constraints (:drop-constraints command)]
+             :when (and table constraints)
+             constraint (if (coll? constraints) constraints [constraints])]
+         [(catalog-name table) (catalog-name constraint)])))
+
+(defn- plan-dropped-tables
+  "The tables, as catalog names, that the `{:drop-table t}` commands in `plan`
+  drop.  Dropping a table drops every index and constraint on it, so a later
+  `:create-index` or `:add-constraints` on a table of this set is emitted even
+  though the catalog, read before anything runs, still shows the old one."
+  [plan]
+  (set (for [command plan
+             :let [table (:drop-table command)]
+             :when table]
+         (catalog-name table))))
 
 (defn- sql-literal
   "`s` as a T-SQL string literal, single quotes doubled."
@@ -254,12 +276,9 @@
                 (for [[constraint & specs] add-constraints]
                   (if (or (not *db*)
                           (not (foreign-key-exists? *db* (to-sql-name constraint)))
-                          (some (fn [prior]
-                                  ;; Did we previously drop the constraint?
-                                  (and (= table (:alter-table prior))
-                                       (some (fn [cons] (= cons constraint))
-                                             (:drop-constraints prior))))
-                                @*plan*))
+                          ;; Did an earlier command drop the constraint, or its table?
+                          (contains? (plan-dropped-constraints @*plan*) [(catalog-name table) (catalog-name constraint)])
+                          (contains? (plan-dropped-tables @*plan*) (catalog-name table)))
                     (do
                       (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
                       (format "CONSTRAINT %s FOREIGN KEY %s" 
@@ -393,7 +412,8 @@
     unique  :unique}]
   (if (and *db*
            (index-exists? *db* (to-sql-name table) (to-sql-name index))
-           (not (contains? (plan-dropped-indexes @*plan*) [(catalog-name table) (catalog-name index)])))
+           (not (or (contains? (plan-dropped-indexes @*plan*) [(catalog-name table) (catalog-name index)])
+                    (contains? (plan-dropped-tables @*plan*) (catalog-name table)))))
     (do (log/info (format "   * Skipping CREATE INDEX on table %s name %s because it already exists."
                           (to-sql-name table) (to-sql-name index)))
         nil)
