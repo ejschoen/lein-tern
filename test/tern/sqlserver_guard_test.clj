@@ -830,11 +830,15 @@
          (create-table-after [{:drop-table :T}])
          (add-constraint-after [{:alter-table :T :drop-constraints [:FK_X]}] :t)])
 
-;; The one case folding gets wrong: on a database whose collation is case-sensitive, ix_a and
-;; IX_A are two indexes, and a drop of ix_a counts for both, so the column drop is accepted
-;; here and fails when it runs (error 5074).
-(expect {:sql ["drop index if exists ix_a on t" "ALTER TABLE t DROP column a"] :errors [] :exit nil}
-        (migrate-with-dependents [] {["t" "a"] ["ix_a" "IX_A"]} {} [(assoc (dropping :t :a) :drop-index [:ix_a])]))
+;; What folding gets wrong on a database whose collation is case-sensitive, where ix_a and IX_A
+;; are two indexes: a drop of ix_a counts for both, so the column drop is accepted here and
+;; fails when it runs (error 5074); with neither dropped, the line names only ix_a.  (A single
+;; name spelled in another case than the catalog's, as in the cases above, is the same fault
+;; there.)
+(expect [{:sql ["drop index if exists ix_a on t" "ALTER TABLE t DROP column a"] :errors [] :exit nil}
+         {:sql [] :errors [(refusal "t" "a" "ix_a")] :exit 1}]
+        [(migrate-with-dependents [] {["t" "a"] ["ix_a" "IX_A"]} {} [(assoc (dropping :t :a) :drop-index [:ix_a])])
+         (migrate-with-dependents [] {["t" "a"] ["ix_a" "IX_A"]} {} [(dropping :t :a)])])
 
 ;; ---------------------------------------------------------------------------
 ;; An index an earlier command of the migration creates is not in the catalog, which is read
@@ -859,6 +863,10 @@
           :exit       nil}]
         [(run-migration-offline {} t-a-default [{:create-index :ix_n :on :t :columns [:a]} (dropping :t :a)])
          (run-migration-offline {} t-a-default [{:create-index :ix_n :on :t :columns [:b]} (dropping :t :a)])])
+
+;; A key column written with DESC is the column itself, as in an override's CREATE INDEX.
+(expect (refused-by "ix_n" "CREATE  INDEX ix_n ON t (a DESC)")
+        (migrate-with-dependents [] {} t-a-default [{:create-index :ix_n :on :t :columns ["a DESC"]} (dropping :t :a)]))
 
 ;; Any column of the :create-index counts, also with a prefix length; the table, index and
 ;; columns compare folded, kebab-case or in another case; the line names the index as its
@@ -933,19 +941,41 @@
                                   {:create-index :ix_n :on :t :columns [:a]}
                                   (dropping :t :a)]))
 
-;; A {:drop-index i :on t} command does not drop an index the migration creates: its guard
-;; reads the catalog as it was before the migration, where the index is not, so it emits
-;; nothing, the index stays, and the column drop is refused.
+;; A {:drop-index i :on t} command's guard reads the catalog as it was before the migration:
+;; where that catalog holds no index of the name, the command emits nothing, the index the
+;; migration created stays, and the column drop is refused ...
 (expect (refused-by "ix_n" "CREATE  INDEX ix_n ON t (a)")
         (migrate-with-dependents [] {} t-a-default [{:create-index :ix_n :on :t :columns [:a]}
                                                     {:drop-index :ix_n :on :t}
                                                     (dropping :t :a)]))
 
-;; An index both the catalog and an earlier create show (the create's guard skips it) is
-;; named once.
-(expect (refused-by "ix_n")
-        (migrate-with-dependents [] {["t" "a"] ["ix_n"]} t-a-default [{:create-index :ix_n :on :t :columns [:a]}
+;; ... while where it holds one (on b here, dropped and created again on a), the command emits
+;; its DROP INDEX, which drops the created index: accepted.
+(expect (accepted-after "drop index if exists ix_n on t" "CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t")
+        (migrate-with-dependents [] {["t" "b"] ["ix_n"]} t-a-default [{:alter-table :t :drop-index [:ix_n]}
+                                                                      {:create-index :ix_n :on :t :columns [:a]}
+                                                                      {:drop-index :ix_n :on :t}
                                                                       (dropping :t :a)]))
+
+;; A :create-index its guard skips creates nothing: the catalog's ix_n on b stays, and t.a is
+;; dropped.  Once an earlier command drops ix_n, the guard emits the create, and it counts.
+(expect [(accepted-after)
+         (refused-by "ix_n" "drop index if exists ix_n on t" "CREATE  INDEX ix_n ON t (a)")]
+        [(migrate-with-dependents [] {["t" "b"] ["ix_n"]} t-a-default [{:create-index :ix_n :on :t :columns [:a]}
+                                                                      (dropping :t :a)])
+         (migrate-with-dependents [] {["t" "b"] ["ix_n"]} t-a-default [{:alter-table :t :drop-index [:ix_n]}
+                                                                      {:create-index :ix_n :on :t :columns [:a]}
+                                                                      (dropping :t :a)])])
+
+;; An index named twice, by two creates or by the catalog and an override's create, is named
+;; once.
+(expect [(refused-by "ix_n" "CREATE  INDEX ix_n ON t (a)" "CREATE  INDEX ix_n ON t (a)")
+         (refused-by "ix_n" "CREATE INDEX ix_n ON t (a)")]
+        [(migrate-with-dependents [] {} t-a-default [{:create-index :ix_n :on :t :columns [:a]}
+                                                    {:create-index :ix_n :on :t :columns [:a]}
+                                                    (dropping :t :a)])
+         (migrate-with-dependents [] {["t" "a"] ["ix_n"]} t-a-default [(overriding "CREATE INDEX ix_n ON t (a)")
+                                                                      (dropping :t :a)])])
 
 ;; Without a connection nothing is refused: there is no catalog, and the generators emit
 ;; their statements unguarded.

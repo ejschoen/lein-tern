@@ -305,14 +305,26 @@
                            (when table [(folded-name table)]))))
                plan)))
 
+(defn- create-index-skipped?
+  "Whether the guard of a `{:create-index index :on table}` skips it when the
+  commands `earlier` come before it in the migration: tern holds a connection,
+  the catalog, read before the migration runs, shows the index, and no earlier
+  command drops the index or its table."
+  [earlier table index]
+  (boolean (and *db*
+                (index-exists? *db* (to-sql-name table) (to-sql-name index))
+                (not (or (contains? (plan-dropped-indexes earlier) [(folded-name table) (folded-name index)])
+                         (contains? (plan-dropped-tables earlier) (folded-name table)))))))
+
 (defn- created-indexes
-  "The indexes `command` creates (as-run), each [table index columns]: the table
-  folded (folded-name), the index as a catalog name, the columns a set of folded
-  names.  A `{:create-index i :on t :columns [...]}` creates i over its columns,
-  each without the (n) prefix length the generator strips; a `:sqlserver`
-  override creates what its CREATE INDEX statements create, over their key and
-  included columns."
-  [command]
+  "The indexes `command` creates (as-run) when the commands `earlier` come before
+  it, each [table index columns]: the table folded (folded-name), the index as a
+  catalog name, the columns a set of folded names.  A `{:create-index i :on t
+  :columns [...]}` creates i over its columns, each without the (n) prefix length
+  the generator strips or a trailing ASC or DESC, unless its guard skips it
+  (create-index-skipped?); a `:sqlserver` override creates what its CREATE INDEX
+  statements create, over their key and included columns."
+  [earlier command]
   (as-run command
           (fn [override]
             (for [statement (override-statements override)
@@ -324,31 +336,35 @@
                                          (when included (re-seq sql-identifier included)))]
                       (folded-name (unquoted-identifier column))))]))
           (fn [{index :create-index table :on columns :columns}]
-            (when (and index table)
+            (when (and index table (not (create-index-skipped? earlier table index)))
               [[(folded-name table)
                 (catalog-name index)
                 (set (for [column columns]
-                       (folded-name (second (re-matches #"([^()]+)(?:\(\d+\))?" (name column))))))]]))))
+                       (folded-name (s/replace (second (re-matches #"([^()]+)(?:\(\d+\))?" (name column)))
+                                               #"(?i)\s+(?:ASC|DESC)$" ""))))]]))))
 
-(defn- guarded-index-drop?
-  "Whether `command` is a `{:drop-index i :on t}` that its generator emits only
-  when the catalog, read before the migration runs, shows the index: it never
-  drops an index an earlier command of the same migration creates."
+(defn- skipped-index-drop?
+  "Whether `command` is a `{:drop-index i :on t}` whose guard emits nothing: its
+  generator emits the DROP INDEX only when the catalog, read before the migration
+  runs, shows the index, so it drops an index an earlier command of the same
+  migration creates only when the catalog already held an index of that name."
   [command]
-  (and (:drop-index command) (not (:alter-table command)) (not (:sqlserver command))))
+  (boolean (and (:drop-index command) (:on command) (not (:alter-table command)) (not (:sqlserver command))
+                (not (index-exists? *db* (to-sql-name (:on command)) (to-sql-name (:drop-index command)))))))
 
 (defn- plan-created-indexes
   "The indexes on `table` (folded) that the commands in `plan` create and no
   later command in `plan` drops, in plan order, each [index columns] as
   created-indexes gives them.  A later drop is a DROP INDEX of the index on the
   table in an override, the `:drop-index` key of an `:alter-table` of the table,
-  or a drop of the whole table, but not a guarded-index-drop?."
+  a `{:drop-index i :on t}` its guard emits, or a drop of the whole table, but
+  not a skipped-index-drop?."
   [plan table]
   (let [plan (vec plan)]
     (for [position         (range (count plan))
-          [t index columns] (created-indexes (nth plan position))
+          [t index columns] (created-indexes (subvec plan 0 position) (nth plan position))
           :when (= t table)
-          :let [later (remove guarded-index-drop? (subvec plan (inc position)))]
+          :let [later (remove skipped-index-drop? (subvec plan (inc position)))]
           :when (not (or (contains? (plan-dropped-indexes later) [t (folded-name index)])
                          (contains? (plan-dropped-tables later) t)))]
       [index columns])))
@@ -579,10 +595,7 @@
     table   :on
     columns :columns
     unique  :unique}]
-  (if (and *db*
-           (index-exists? *db* (to-sql-name table) (to-sql-name index))
-           (not (or (contains? (plan-dropped-indexes @*plan*) [(folded-name table) (folded-name index)])
-                    (contains? (plan-dropped-tables @*plan*) (folded-name table)))))
+  (if (create-index-skipped? (if *plan* @*plan* []) table index)
     (do (log/info (format "   * Skipping CREATE INDEX on table %s name %s because it already exists."
                           (to-sql-name table) (to-sql-name index)))
         nil)
