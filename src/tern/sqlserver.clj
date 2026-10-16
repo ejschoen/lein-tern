@@ -167,23 +167,42 @@
   (.toLowerCase ^String (catalog-name k) java.util.Locale/ROOT))
 
 (def ^:private drop-index-clause
-  "A T-SQL `DROP INDEX [IF EXISTS] <index> ON <table>`: keywords in any case, any
-  whitespace, each name bare, [bracketed] or \"double-quoted\", the table possibly
-  qualified (only its last segment is captured).  Group 1 is the index, group 2
-  the table.  The drop clauses are matched as a whole statement for the refusal
-  (whole-statement) and anywhere in a statement for the guards (anywhere)."
-  #"(?i)\bDROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\".;,]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,]+)")
+  "A T-SQL `DROP INDEX [IF EXISTS] <index> ON <table>[, <index> ON <table> ...]`,
+  or the legacy `DROP INDEX <table>.<index>[, ...]`: keywords in any case, any
+  whitespace, each name bare (ending at a quote too, so that a statement in a
+  string literal reads), [bracketed] or \"double-quoted\", a table possibly
+  qualified (only its last segment counts).  Group 1 is the list of drops
+  (drop-index-item finds each).  The drop clauses are matched as a whole
+  statement for the refusal (whole-statement) and anywhere in a statement for
+  the guards (anywhere)."
+  #"(?i)\bDROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?((?:(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)|(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s*\.\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+))(?:\s*,\s*(?:(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)|(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s*\.\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)))*)")
+
+(def ^:private drop-index-item
+  "One drop of a list drop-index-clause has matched: groups 1 and 2 are the index
+  and the table of an `<index> ON <table>`, groups 3 and 4 the table and the index
+  of a legacy `<table>.<index>`."
+  #"(?i)(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)|(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s*\.\s*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)")
 
 (def ^:private drop-table-clause
-  "A T-SQL `DROP TABLE [IF EXISTS] <table>`, read as drop-index-clause reads its
-  names (a bare name also ends at a parenthesis).  Group 1 is the table."
-  #"(?i)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\".;,()]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+)")
+  "A T-SQL `DROP TABLE [IF EXISTS] <table>[, <table> ...]`, read as
+  drop-index-clause reads its names (a bare name also ends at a parenthesis).
+  Group 1 is the list of tables (qualified-name finds each)."
+  #"(?i)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?((?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s*,\s*(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+))*)")
+
+(def ^:private qualified-name
+  "One possibly qualified name of a list; group 1 is its last segment."
+  #"(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)")
 
 (def ^:private drop-constraint-clause
-  "A T-SQL `ALTER TABLE <table> DROP CONSTRAINT [IF EXISTS] <constraint>[,
-  <constraint> ...]`, read as drop-table-clause reads its names.  Group 1 is the
-  table, group 2 the constraints (sql-identifier finds each)."
-  #"(?i)\bALTER\s+TABLE\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\".;,()]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+)\s+DROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?((?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+)(?:\s*,\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+))*)")
+  "A T-SQL `ALTER TABLE <table> DROP [CONSTRAINT] [IF EXISTS] <constraint>[,
+  [CONSTRAINT] [IF EXISTS] <constraint> ...]`, read as drop-table-clause reads its
+  names; COLUMN and PERIOD, which T-SQL drops in the same statement, end the list.
+  Group 1 is the table, group 2 the list (drop-constraint-item finds each)."
+  #"(?i)\bALTER\s+TABLE\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)\s+DROP\s+((?:CONSTRAINT\s+)?(?:IF\s+EXISTS\s+)?(?!(?:COLUMN|PERIOD)\b)(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s*,\s*(?:CONSTRAINT\s+)?(?:IF\s+EXISTS\s+)?(?!(?:COLUMN|PERIOD)\b)(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+))*)")
+
+(def ^:private drop-constraint-item
+  "One constraint of a list drop-constraint-clause has matched; group 1 is its name."
+  #"(?i)(?:\bCONSTRAINT\s+)?(?:\bIF\s+EXISTS\s+)?(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)")
 
 (def ^:private create-index-clause
   "A T-SQL `CREATE [UNIQUE] [CLUSTERED|NONCLUSTERED] [COLUMNSTORE] INDEX <index>
@@ -194,16 +213,16 @@
   ASC or DESC.  Group 1 is the index, group 2 the table, group 3 the key columns
   (index-key-column finds each), group 4 the included columns, if any
   (sql-identifier finds each)."
-  #"(?i)\bCREATE\s+(?:UNIQUE\s+)?(?:(?:CLUSTERED|NONCLUSTERED)\s+)?(?:COLUMNSTORE\s+)?INDEX\s+(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\".;,()]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+)\s*\(\s*((?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+)(?:\s+(?:ASC|DESC))?(?:\s*,\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+)(?:\s+(?:ASC|DESC))?)*)\s*\)(?:\s*INCLUDE\s*\(\s*((?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+)(?:\s*,\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+))*)\s*\))?")
+  #"(?i)\bCREATE\s+(?:UNIQUE\s+)?(?:(?:CLUSTERED|NONCLUSTERED)\s+)?(?:COLUMNSTORE\s+)?INDEX\s+(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)\s*\(\s*((?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s+(?:ASC|DESC))?(?:\s*,\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s+(?:ASC|DESC))?)*)\s*\)(?:\s*INCLUDE\s*\(\s*((?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s*,\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+))*)\s*\))?")
 
 (def ^:private sql-identifier
   "One name of a list a clause pattern above has matched."
-  #"\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+")
+  #"\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+")
 
 (def ^:private index-key-column
   "One key column of a list create-index-clause has matched, with its ASC or
   DESC.  Group 1 is the name."
-  #"(?i)(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\".;,()]+)(?:\s+(?:ASC|DESC))?")
+  #"(?i)(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s+(?:ASC|DESC))?")
 
 (defn- unquoted-identifier
   "`s` without the [brackets] or \"double quotes\" that delimit it, if any."
@@ -236,6 +255,26 @@
   [sql]
   (filter string? (tree-seq sequential? seq sql)))
 
+(def ^:private identifier-token
+  "One identifier as a statement may spell it, anywhere, a string literal
+  included: [bracketed] (group 1), \"double-quoted\" (group 2), or a bare run of
+  letters, digits, _, @, # and $ (group 3)."
+  #"\[([^\]]+)\]|\"([^\"]+)\"|([\p{L}\p{N}_@#$]+)")
+
+(defn- named-in
+  "The folded names (folded-name) the identifier tokens in the statements of
+  `sql` spell."
+  [sql]
+  (set (for [statement (statement-strings sql)
+             [_ bracketed quoted bare] (re-seq identifier-token statement)]
+         (folded-name (or bracketed quoted bare)))))
+
+(defn- claimed-object
+  "The object a plan reader's claim names: the index or constraint of a [table
+  name] pair, or the table itself."
+  [claim]
+  (if (vector? claim) (peek claim) claim))
+
 (defn- as-run
   "What `read-override` finds in the `:sqlserver` override of `command` when it
   has one, matching each clause as a whole statement (whole-statement), and
@@ -249,24 +288,33 @@
     (read-command command)))
 
 (defn- as-claimed
-  "What `read-override` finds in the `:sqlserver` override of `command`, if it
-  has one, matching each clause anywhere in a statement (anywhere), together
-  with what `read-command` finds in the command's own keys.  The guards read the
-  plan this way: a guard that missed a drop would skip a create or an add the
-  catalog still shows, losing the object without a word, while one that counts
-  a drop too many emits a create or an add that fails when it runs."
+  "What `read-override` finds in the `:sqlserver` override of `command` when it
+  has one, matching each clause anywhere in a statement (anywhere), together with
+  those claims of the command's own keys (`read-command`) whose object the
+  override names somewhere in its text (named-in); without an override, what
+  the keys claim.  The guards read the plan this way: a guard that missed a drop
+  would skip a create or an add the catalog still shows, losing the object
+  without a word, while one that counts a drop too many emits a create or an
+  add that fails when it runs.  A key whose object the override never mentions
+  is an instruction for another database, and SQL Server keeps the object."
   [command read-override read-command]
-  (concat (some->> (:sqlserver command) (read-override anywhere)) (read-command command)))
+  (if-let [override (:sqlserver command)]
+    (let [named (named-in override)]
+      (concat (read-override anywhere override)
+              (filter #(contains? named (claimed-object %)) (read-command command))))
+    (read-command command)))
 
 (defn- override-dropped-indexes
-  "The [table index] pairs, folded (folded-name), that the DROP INDEX ... ON ...
-  clauses in the statements of a `:sqlserver` override drop, each clause found by
-  `match` (whole-statement or anywhere).  A DROP INDEX naming no table drops
-  nothing here."
+  "The [table index] pairs, folded (folded-name), that the DROP INDEX clauses in
+  the statements of a `:sqlserver` override drop, each clause found by `match`
+  (whole-statement or anywhere), every drop of its list.  A DROP INDEX naming no
+  table drops nothing here."
   [match override]
   (for [statement (statement-strings override)
-        [_ index table] (match drop-index-clause statement)]
-    [(folded-name (unquoted-identifier table)) (folded-name (unquoted-identifier index))]))
+        [_ drops] (match drop-index-clause statement)
+        [_ index table legacy-table legacy-index] (re-seq drop-index-item drops)]
+    [(folded-name (unquoted-identifier (or table legacy-table)))
+     (folded-name (unquoted-identifier (or index legacy-index)))]))
 
 (defn- plan-dropped-indexes
   "The [table index] pairs, folded (folded-name), that the commands in `plan`
@@ -294,7 +342,7 @@
   [match override]
   (for [statement (statement-strings override)
         [_ table constraints] (match drop-constraint-clause statement)
-        constraint (re-seq sql-identifier constraints)]
+        [_ constraint] (re-seq drop-constraint-item constraints)]
     [(folded-name (unquoted-identifier table)) (folded-name (unquoted-identifier constraint))]))
 
 (defn- plan-dropped-constraints
@@ -315,10 +363,11 @@
 (defn- override-dropped-tables
   "The tables, folded (folded-name), that the DROP TABLE clauses in the
   statements of a `:sqlserver` override drop, each clause found by `match`
-  (whole-statement or anywhere)."
+  (whole-statement or anywhere), every table of its list."
   [match override]
   (for [statement (statement-strings override)
-        [_ table] (match drop-table-clause statement)]
+        [_ tables] (match drop-table-clause statement)
+        [_ table] (re-seq qualified-name tables)]
     (folded-name (unquoted-identifier table))))
 
 (defn- plan-dropped-tables
