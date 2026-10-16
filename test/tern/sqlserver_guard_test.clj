@@ -687,8 +687,11 @@
 ;; ---------------------------------------------------------------------------
 ;; Tables and constraints are read the same way: an earlier override's DROP TABLE
 ;; statement drops that table, its ALTER TABLE ... DROP CONSTRAINT statement the
-;; constraints it names, and a command with an override counts only by them, not by
-;; its :drop-table or :drop-constraints key, which does not run.
+;; constraints it names.  For the column-drop refusal a command with an override counts
+;; only by them, not by its :drop-table or :drop-constraints key, which does not run; for
+;; the guards (create-table, create-index, add-constraints) its keys count as well, so a
+;; drop the override performs in a form not read never leaves a create or an add silently
+;; skipped: at worst the create or add fails when it runs.
 
 ;; A DROP TABLE of t in an override drops t's indexes, in the forms a DROP INDEX statement
 ;; may take: the column drop is accepted.  A DROP TABLE of another table, or one behind a
@@ -704,8 +707,8 @@
          (after-override ["DROP TABLE u"])
          (after-override ["IF OBJECT_ID('t') IS NOT NULL DROP TABLE t"])])
 
-;; A :drop-table of t with an override counts only by the override: an empty one, or one
-;; that drops another table, leaves t's indexes (refused); one that drops t counts.
+;; For the refusal a :drop-table of t with an override counts only by the override: an empty
+;; one, or one that drops another table, leaves t's indexes (refused); one that drops t counts.
 (expect [{:sql [] :errors [(refusal "t" "a" "ix_a")] :exit 1}
          {:sql ["DROP TABLE u"] :errors [(refusal "t" "a" "ix_a")] :exit 1}
          {:sql ["DROP TABLE t" column-and-default] :errors [] :exit nil}]
@@ -713,22 +716,25 @@
                (migrate-with-dependents [] t-a-index t-a-default
                                         [{:drop-table :t :sqlserver override} (dropping :t :a)]))))
 
-;; The create-table guard reads it too: after a :drop-table of t whose override drops another
-;; table, CREATE TABLE t is skipped while the catalog shows t; after another command whose
-;; override drops t, it is emitted.
-(expect [[nil nil] [nil ["CREATE TABLE t (a INT)"]]]
+;; The create-table guard counts the key as well: after a :drop-table of t whose override drops
+;; another table, CREATE TABLE t is emitted (and fails when it runs if t is still there);
+;; after another command whose override drops another table it is skipped while the catalog
+;; shows t; after one whose override drops t it is emitted.
+(expect [[nil ["CREATE TABLE t (a INT)"]] [nil nil] [nil ["CREATE TABLE t (a INT)"]]]
         [(create-table-after [{:drop-table :t :sqlserver ["DROP TABLE u"]}])
+         (create-table-after [(overriding "DROP TABLE u")])
          (create-table-after [(overriding "DROP TABLE [t]")])])
 
 ;; An ALTER TABLE ... DROP CONSTRAINT of fk_x on t in an override drops it, in the forms a
-;; DROP INDEX statement may take, so the add-constraints guard adds it again.  One that drops
-;; another constraint, or fk_x on another table, or drops it behind a condition, drops
-;; nothing here: the guard skips the add while the catalog shows fk_x.
+;; DROP INDEX statement may take, behind a condition too (the guards read a drop anywhere in
+;; a statement), so the add-constraints guard adds it again.  One that drops another
+;; constraint, or fk_x on another table, drops nothing here: the guard skips the add while
+;; the catalog shows fk_x.
 (expect [[[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
          [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
          [[] []]
          [[] []]
-         [[] []]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]]
         [(add-constraint-after [(overriding "ALTER TABLE t DROP CONSTRAINT fk_x")] :t)
          (add-constraint-after [(overriding ["alter table [dbo].[t] drop constraint if exists \"fk_x\";"])] :t)
          (add-constraint-after [(overriding "ALTER TABLE t DROP CONSTRAINT fk_y")] :t)
@@ -742,15 +748,39 @@
         [(add-constraint-after [(overriding "ALTER TABLE t DROP CONSTRAINT fk_a, [fk_b]")] :t [:fk_a :fk_b] #{"fk_a" "fk_b"})
          (add-constraint-after [(overriding "ALTER TABLE t DROP CONSTRAINT fk_a")] :t [:fk_a :fk_b] #{"fk_a" "fk_b"})])
 
-;; An :alter-table of t with an override counts only by the override: its :drop-constraints
-;; key does not run, so after an empty override, or one that drops a trigger, fk_x is not
-;; added again; after one that drops fk_x it is.
-(expect [[[] []]
-         [[] []]
+;; For the add-constraints guard an :alter-table of t with an override counts by its
+;; :drop-constraints key as well: after an empty override, one that drops a trigger, or one
+;; that drops fk_x, fk_x is added again (and fails when it runs if the override left it).
+(expect [[[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
          [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]]
         [(add-constraint-after [{:alter-table :t :drop-constraints [:fk_x] :sqlserver []}] :t)
          (add-constraint-after [{:alter-table :t :drop-constraints [:fk_x] :sqlserver ["drop trigger if exists x"]}] :t)
          (add-constraint-after [{:alter-table :t :drop-constraints [:fk_x] :sqlserver ["ALTER TABLE t DROP CONSTRAINT fk_x"]}] :t)])
+
+;; The guards read a drop behind a condition, in the house style of i2k's overrides, as a
+;; drop: after an override that drops fk_x if it exists, fk_x is added again, and after one
+;; that drops t if it exists, CREATE TABLE t is emitted; a drop counted too often there at
+;; worst makes the add or the create fail when it runs, never skips it without a word.
+(expect [[[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+         [nil ["CREATE TABLE t (a INT)"]]]
+        [(add-constraint-after [(overriding ["IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'fk_x') ALTER TABLE t DROP CONSTRAINT fk_x"])] :t)
+         (create-table-after [(overriding ["IF OBJECT_ID('t') IS NOT NULL DROP TABLE t"])])])
+
+;; The refusal does not: after an override that drops ix_a if it exists, the create-index
+;; guard emits CREATE INDEX ix_a, while a drop of t.a, which ix_a contains, is still refused.
+(expect [{:sql ["IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_a') DROP INDEX ix_a ON t" "CREATE  INDEX ix_a ON t (b)"] :errors [] :exit nil}
+         (refused-after "IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_a') DROP INDEX ix_a ON t")]
+        [(migrate-with-dependents [] t-a-index {} [(overriding ["IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_a') DROP INDEX ix_a ON t"])
+                                                   {:create-index :ix_a :on :t :columns [:b]}])
+         (after-override ["IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_a') DROP INDEX ix_a ON t"])])
+
+;; The override readers fold too: a DROP TABLE T lets CREATE TABLE t through, and an ALTER
+;; TABLE T DROP CONSTRAINT FK_X has fk_x added again.
+(expect [[nil ["CREATE TABLE t (a INT)"]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]]
+        [(create-table-after [(overriding "DROP TABLE T")])
+         (add-constraint-after [(overriding "ALTER TABLE T DROP CONSTRAINT FK_X")] :t)])
 
 (defn- migrate-over-fks
   "migrate-with-dependents with no index or default on any column and a catalog whose
@@ -762,19 +792,22 @@
 (def ^:private taxnodes-down
   "i2kdb 20160603031901-cascade_taxonomy_and_taxnode_deletes.edn's :down, its first two
   commands: on SQL Server the first runs only its override, which drops a trigger and
-  leaves fk_taxnodes_parent_id_cd in place; the second adds that constraint."
+  leaves fk_taxnodes_parent_id_cd in place, though its key claims the drop; the second
+  adds that constraint."
   [{:alter-table :taxnodes
     :drop-constraints [:fk_taxnodes_parent_id_cd]
     :sqlserver ["drop trigger if exists delete_taxnode"]}
    {:alter-table :taxnodes
     :add-constraints [[:fk_taxnodes_parent_id_cd "(parent_id) REFERENCES taxnodes(id)"]]}])
 
-;; The real shape: over a catalog that shows fk_taxnodes_parent_id_cd, the add is skipped by
-;; its guard, since the override did not drop the constraint, and nothing is refused ...
-(expect {:sql ["drop trigger if exists delete_taxnode"] :errors [] :exit nil}
+;; The real shape: over a catalog that shows fk_taxnodes_parent_id_cd, the first command's key
+;; claims the drop, so the guard emits the add, which fails when it runs (the override left
+;; the constraint) rather than leaving the cascade key in place without a word; nothing is
+;; refused ...
+(expect {:sql ["drop trigger if exists delete_taxnode" "ALTER TABLE taxnodes ADD CONSTRAINT fk_taxnodes_parent_id_cd FOREIGN KEY (parent_id) REFERENCES taxnodes(id)"] :errors [] :exit nil}
         (migrate-over-fks #{"fk_taxnodes_parent_id_cd"} taxnodes-down))
 
-;; ... while with an override that drops the constraint too, the add is emitted.
+;; ... and with an override that drops the constraint too, the add is emitted and runs.
 (expect {:sql    ["ALTER TABLE taxnodes DROP CONSTRAINT fk_taxnodes_parent_id_cd" "drop trigger if exists delete_taxnode" "ALTER TABLE taxnodes ADD CONSTRAINT fk_taxnodes_parent_id_cd FOREIGN KEY (parent_id) REFERENCES taxnodes(id)"]
          :errors []
          :exit   nil}
@@ -782,6 +815,19 @@
                           (assoc-in taxnodes-down [0 :sqlserver]
                                     ["ALTER TABLE taxnodes DROP CONSTRAINT fk_taxnodes_parent_id_cd"
                                      "drop trigger if exists delete_taxnode"])))
+
+;; The two readings side by side: a :drop-table of t whose override drops t behind a condition,
+;; a form not read, lets a later CREATE TABLE t through, as the guard counts the key's claim;
+;; a later drop of t.a, which ix_a contains, is still refused, as the refusal counts only what
+;; the override is read to drop.
+(expect [["IF OBJECT_ID('t') IS NOT NULL DROP TABLE t" "CREATE TABLE t (a INT)"]
+         {:sql ["IF OBJECT_ID('t') IS NOT NULL DROP TABLE t"] :errors [(refusal "t" "a" "ix_a")] :exit 1}]
+        [(migrate-over-catalog {:tables #{"t"}}
+                               [{:drop-table :t :sqlserver ["IF OBJECT_ID('t') IS NOT NULL DROP TABLE t"]}
+                                {:create-table :t :columns [[:a "INT"]]}])
+         (migrate-with-dependents [] t-a-index t-a-default
+                                  [{:drop-table :t :sqlserver ["IF OBJECT_ID('t') IS NOT NULL DROP TABLE t"]}
+                                   (dropping :t :a)])])
 
 ;; ---------------------------------------------------------------------------
 ;; An :alter-table's :drop-index key may name a single index as a keyword: its own statement
@@ -794,6 +840,11 @@
 ;; ... and only that index: a keyword naming another index leaves the refusal.
 (expect refused-ix-a
         (migrate-with-dependents [] t-a-index t-a-default [(assoc (dropping :t :a) :drop-index :ix_b)]))
+
+;; A vector keeps every index it names, and a string names one index.
+(expect [["drop index if exists x on t,y on t"] ["drop index if exists x on t"]]
+        [(vec (sqlserver/generate-sql {:alter-table :t :drop-index [:x :y]}))
+         (vec (sqlserver/generate-sql {:alter-table :t :drop-index "x"}))])
 
 ;; ---------------------------------------------------------------------------
 ;; The plan's names are compared with the catalog's folded: SQL Server's default collation
@@ -839,6 +890,16 @@
          {:sql [] :errors [(refusal "t" "a" "ix_a")] :exit 1}]
         [(migrate-with-dependents [] {["t" "a"] ["ix_a" "IX_A"]} {} [(assoc (dropping :t :a) :drop-index [:ix_a])])
          (migrate-with-dependents [] {["t" "a"] ["ix_a" "IX_A"]} {} [(dropping :t :a)])])
+
+;; Names fold in the root locale: under a Turkish default locale IX_A still folds to ix_a, not
+;; to a dotless i.  (folded-name is looked up when the test runs, so this file still loads
+;; against an older generator that lacks it.)
+(expect "ix_a"
+        (let [folded-name (ns-resolve 'tern.sqlserver 'folded-name)
+              default     (java.util.Locale/getDefault)]
+          (try (java.util.Locale/setDefault (java.util.Locale. "tr" "TR"))
+               (folded-name :IX_A)
+               (finally (java.util.Locale/setDefault default)))))
 
 ;; ---------------------------------------------------------------------------
 ;; An index an earlier command of the migration creates is not in the catalog, which is read
@@ -905,6 +966,38 @@
          (accepted-after "CREATE INDEX ix_n ON u (a)")]
         [(after-create-override ["CREATE INDEX ix_n ON t (b) INCLUDE (c)"])
          (after-create-override ["CREATE INDEX ix_n ON u (a)"])])
+
+;; Creates are read generously, as one counted too often only refuses a column drop: a CREATE
+;; INDEX clause anywhere in a statement counts, behind IF NOT EXISTS (the repair migrations'
+;; form), before WHERE, WITH or ON <filegroup>, with COLUMNSTORE, and so does one in an
+;; :update, which runs as written ...
+(expect [(refused-by "ix_n" "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_n' AND object_id = OBJECT_ID('t')) CREATE INDEX ix_n ON t (a)")
+         (refused-by "ix_n" "CREATE INDEX ix_n ON t (a) WHERE a IS NOT NULL")
+         (refused-by "ix_n" "CREATE INDEX ix_n ON t (b) INCLUDE (a) WITH (ONLINE = ON) ON [PRIMARY]")
+         (refused-by "ix_n" "CREATE NONCLUSTERED COLUMNSTORE INDEX ix_n ON t (a)")
+         (refused-by "ix_n" "CREATE INDEX ix_n ON t (a)")]
+        [(after-create-override ["IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_n' AND object_id = OBJECT_ID('t')) CREATE INDEX ix_n ON t (a)"])
+         (after-create-override ["CREATE INDEX ix_n ON t (a) WHERE a IS NOT NULL"])
+         (after-create-override ["CREATE INDEX ix_n ON t (b) INCLUDE (a) WITH (ONLINE = ON) ON [PRIMARY]"])
+         (after-create-override ["CREATE NONCLUSTERED COLUMNSTORE INDEX ix_n ON t (a)"])
+         (migrate-with-dependents [] {} t-a-default [{:update "CREATE INDEX ix_n ON t (a)"} (dropping :t :a)])])
+
+;; ... still by table and columns: an :update creating ix_n on b, or on u, leaves t.a free.
+(expect [(accepted-after "CREATE INDEX ix_n ON t (b)")
+         (accepted-after "CREATE INDEX ix_n ON u (a)")]
+        [(migrate-with-dependents [] {} t-a-default [{:update "CREATE INDEX ix_n ON t (b)"} (dropping :t :a)])
+         (migrate-with-dependents [] {} t-a-default [{:update "CREATE INDEX ix_n ON u (a)"} (dropping :t :a)])])
+
+;; Order is read command by command: the rebuild idiom, one override dropping ix_n and
+;; creating it again on a, leaves ix_n on a when the column drop runs (refused); an override
+;; that creates ix_n and then drops it again still counts as creating it, a false refusal the
+;; README states.
+(expect [(refused-by "ix_n" "DROP INDEX ix_n ON t" "CREATE INDEX ix_n ON t (a)")
+         (refused-by "ix_n" "CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t")]
+        [(migrate-with-dependents [] {["t" "a"] ["ix_n"]} t-a-default
+                                  [(overriding ["DROP INDEX ix_n ON t" "CREATE INDEX ix_n ON t (a)"]) (dropping :t :a)])
+         (migrate-with-dependents [] {} t-a-default
+                                  [(overriding ["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]) (dropping :t :a)])])
 
 ;; A :create-index with an override creates only what its override creates.
 (expect [(accepted-after "CREATE INDEX ix_n ON t (b)")
