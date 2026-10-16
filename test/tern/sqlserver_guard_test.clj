@@ -1646,7 +1646,8 @@
 ;; A command that holds an :update beside another command key runs the first of the two in its key
 ;; order alone (generate-sql dispatches on its command key), so the plan readers read it by the one
 ;; that runs: by its keys when the other key comes first, its :update never running, and by its
-;; :update when the :update comes first, its keys never running.
+;; :update when the :update comes first, its keys never running, though the guards still count a
+;; drop of those keys where the :update names its object, as they count the keys of an override.
 
 (defn- ordered
   "A command of the key-value pairs `kvs` in the order written, as a migration file
@@ -1730,6 +1731,21 @@
                           (ordered :update "ALTER TABLE t DROP COLUMN d" :alter-table :t :drop-columns [:e])
                           (ordered :update "UPDATE t SET b = 3 WHERE 1 = 0" :alter-table :t :drop-columns [:d])]]
                (:sql (migrate-with-dependents [] {} {} [mixed {:alter-table :t :add-columns [[:d "INT"]]}])))))
+
+;; A key that names no command, a dialect text such as :mysql or :h2 written before a plain :update,
+;; leaves :update the command key, so the :update runs and is read: the add-columns guard adds a
+;; after such an :update that drops a, and not after one that drops b ...
+(expect [["ALTER TABLE t DROP COLUMN IF EXISTS a" "ALTER TABLE t ADD a INT"]
+         ["ALTER TABLE t DROP COLUMN IF EXISTS b"]]
+        (vec (for [mixed [(ordered :mysql "ALTER TABLE t DROP a" :update "ALTER TABLE t DROP COLUMN IF EXISTS a")
+                          (ordered :mysql "ALTER TABLE t DROP b" :update "ALTER TABLE t DROP COLUMN IF EXISTS b")]]
+               (migrate-over-catalog {:columns #{["t" "a"]}} [mixed (adding-a)]))))
+
+;; ... and the create-index guard creates ix_a after such an :update that drops it, and not after
+;; one that drops ix_b, while the catalog shows ix_a.
+(expect [[nil ["CREATE  INDEX ix_a ON t (a)"]] [nil nil]]
+        [(create-after [(ordered :h2 "DROP INDEX IF EXISTS ix_a" :update "DROP INDEX ix_a ON t")] :ix_a)
+         (create-after [(ordered :h2 "DROP INDEX IF EXISTS ix_b" :update "DROP INDEX ix_b ON t")] :ix_a)])
 
 ;; Without a connection nothing is refused: there is no catalog, and the generators emit
 ;; their statements unguarded.
