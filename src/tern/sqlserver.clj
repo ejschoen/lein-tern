@@ -240,9 +240,10 @@
   "`statement` with each comment replaced by one space, as SQL Server reads
   comments: `-- ...` to the end of its line, and `/* ... */`, which nests (a `/*`
   inside one opens another that needs its own `*/`; an unclosed one runs to the
-  end).  String literals are not parsed, so a `--` or `/*` inside one is blanked
-  like any other: that only removes text, and so can only remove a match the text
-  as written still gives."
+  end).  String literals and delimited names are not parsed, so a `--` or `/*`
+  inside one is blanked like any other; whole-statement and anywhere also match
+  the text as written, so that can only cost a match the blanked text alone
+  would have given, never one the text as written gives."
   [^String statement]
   (let [n   (.length statement)
         out (StringBuilder.)]
@@ -275,16 +276,20 @@
   (memoize (fn [clause] (re-pattern (str "\\s*(?:" clause ")\\s*;?\\s*")))))
 
 (defn- whole-statement
-  "The match of `clause` when `statement`, its comments blanked (blank-comments),
-  is that clause alone, as a seq of at most one match: a clause behind a
-  condition or after other text is not read, a comment inside, before or after
-  it does not hide it, and a clause written only inside a comment is not read.
-  Blanking moves this reading towards crediting a drop more often, but only a
-  drop that runs: the column-drop refusal reads the plan this way (as-run), and a
-  drop it credits must run, or the column drop it lets through fails (error
-  5074), while a drop it misses only refuses a migration that would have run."
+  "The match of `clause` when `statement`, as written or with its comments
+  blanked (blank-comments), is that clause alone, as a seq of at most one match:
+  a clause behind a condition or after other text is not read, a comment inside,
+  before or after it does not hide it, and a clause written only inside a
+  comment is not read.  The text as written is matched first, so a `--` or `/*`
+  inside a delimited name ([ix--a]), which blanking would cut, does not hide the
+  drop.  Both readings move this one towards crediting a drop more often, but
+  only a drop that runs: the column-drop refusal reads the plan this way
+  (as-run), and a drop it credits must run, or the column drop it lets through
+  fails (error 5074), while a drop it misses only refuses a migration that would
+  have run."
   [clause statement]
-  (some-> (re-matches (whole-statement-pattern clause) (blank-comments statement)) list))
+  (let [pattern (whole-statement-pattern clause)]
+    (some-> (or (re-matches pattern statement) (re-matches pattern (blank-comments statement))) list)))
 
 (defn- anywhere
   "Every match of `clause` anywhere in `statement`, behind a condition included,
@@ -295,7 +300,7 @@
   drop counted too often makes a create or an add fail when it runs, while one
   missed would skip it and lose the object without a word; and the create reader
   (clause-created-indexes) reads creates this way, where a create counted too
-  often refuses a column drop or emits a DROP INDEX that fails when it runs,
+  often refuses a column drop or emits a DROP INDEX IF EXISTS that does nothing,
   while one missed would let a column drop meet error 5074."
   [clause statement]
   (concat (re-seq clause statement) (re-seq clause (blank-comments statement))))
@@ -528,8 +533,8 @@
   catalog name, the key and included columns a set of folded names.  The clauses
   are found anywhere, in the text as written and with its comments blanked, so a
   create in a comment counts and a comment inside a create does not hide it: a
-  create counted too often refuses a column drop or emits a DROP INDEX that fails
-  when it runs, both loud, while one missed would let a column drop meet error
+  create counted too often refuses a column drop (loud) or emits a DROP INDEX IF
+  EXISTS that does nothing, while one missed would let a column drop meet error
   5074 or leave the index without a word."
   [statements]
   (for [statement statements
@@ -566,10 +571,10 @@
   created-indexes gives them.  A later drop is a DROP INDEX of the index on the
   table in an override, the `:drop-index` key of an `:alter-table` of the table,
   a `{:drop-index i :on t}` command, or a drop of the whole table, each read
-  as-run.  A `{:drop-index i :on t}` counts by its key: its guard emits the DROP
-  INDEX for an index an earlier command creates and nothing between drops again
-  (plan-created-index?), so it runs, and counting it credits no drop that does
-  not run."
+  as-run.  A `{:drop-index i :on t}` counts by its key: its guard emits a DROP
+  INDEX IF EXISTS for an index an earlier command creates and nothing between
+  drops again (plan-created-index?), so the index is gone after it, whether or
+  not it was there, and counting it credits no drop that does not happen."
   [plan table]
   (let [plan (vec plan)]
     (for [position         (range (count plan))
@@ -585,14 +590,16 @@
   table}`, creates the index on the table and no later command in `plan` drops it
   again or drops the table (plan-created-indexes), names compared folded
   (folded-name).  The drop-index guard asks it when the catalog, read before the
-  migration runs, does not show the index.  It errs towards the index being
-  there: it reads creates generously (a create in a comment, a string or behind
-  a condition counts) and a drop between only when it runs (as-run).  So its loud
-  side is a DROP INDEX of an index that is not there when it runs, which fails
-  with error 3701, and only two things cause it: a create read that does not run,
-  or a drop between that runs in a form not read as one (behind a condition,
-  say).  An index missed instead would have its drop skipped and stay on the
-  table without a word."
+  migration runs, does not show the index, and on its yes emits DROP INDEX IF
+  EXISTS.  It errs towards the index being there: it reads creates generously (a
+  create in a comment, a string or behind a condition counts) and a drop between
+  only as a whole statement of an override or a key (as-run), so it can say yes
+  for an index that is not there when the drop runs (a create that did not run,
+  or a drop between in a form not read as one: inside the creating command
+  itself, in an :update, behind a condition), and the IF EXISTS makes that drop a
+  no-op rather than error 3701.  The side left is silent: a create written in a
+  form not read (dynamic SQL that does not spell the statement, say) is missed,
+  its drop skipped, and the index stays on the table without a word."
   [plan table index]
   (boolean (some (fn [[created _]] (= (folded-name created) (folded-name index)))
                  (plan-created-indexes plan (folded-name table)))))
@@ -843,13 +850,19 @@
 (defmethod generate-sql
   :drop-index
   [{index :drop-index table :on}]
-  ;; The index is there when the catalog, read before the migration runs, shows it, or when an
-  ;; earlier command of the migration creates it and nothing between drops it again.
-  (if (or (not *db*)
-          (index-exists? *db* (to-sql-name table) (to-sql-name index))
-          (plan-created-index? (if *plan* @*plan* []) table index))
+  ;; The index is there when the catalog, read before the migration runs, shows it: a plain DROP
+  ;; INDEX.  When only the migration's earlier commands hold it (plan-created-index?), the drop is
+  ;; DROP INDEX IF EXISTS, a no-op where the plan reads an index that is not there.
+  (cond
+    (or (not *db*) (index-exists? *db* (to-sql-name table) (to-sql-name index)))
     (do (log/info " - Dropping index" (log/highlight (name index)))
         [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])
+
+    (plan-created-index? (if *plan* @*plan* []) table index)
+    (do (log/info " - Dropping index" (log/highlight (name index)) "created earlier in this migration, if it exists")
+        [(format "DROP INDEX IF EXISTS %s ON %s" (to-sql-name index) (to-sql-name table))])
+
+    :else
     (do (log/info (format "   * Skipping DROP INDEX on table %s index %s because that index does not exist."
                           table index))
         nil)))

@@ -803,15 +803,28 @@
                                                    {:create-index :ix_a :on :t :columns [:b]}])
          (after-override ["IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_a') DROP INDEX ix_a ON t"])])
 
-;; Comments are blanked before a clause is read.  The refusal reads only the text without them:
-;; a drop with a comment inside, before or after it runs and is credited (accepted), nested
-;; comments included ...
+;; Comments are blanked before a clause is read.  The refusal reads the text as written or
+;; without them: a drop with a comment inside, before or after it runs and is credited
+;; (accepted), nested comments included ...
 (expect [(accepted-after "DROP /* old */ INDEX ix_a ON t")
          (accepted-after "DROP INDEX ix_a ON t -- gone")
          (accepted-after "/* tidy /* nested */ up */ DROP INDEX ix_a ON t")]
         [(after-override ["DROP /* old */ INDEX ix_a ON t"])
          (after-override ["DROP INDEX ix_a ON t -- gone"])
          (after-override ["/* tidy /* nested */ up */ DROP INDEX ix_a ON t"])])
+
+;; ... a comment becomes one space, so DROP/**/INDEX reads as DROP INDEX, and a line comment ends
+;; at its line, so a drop on the line after a -- note is read (accepted) ...
+(expect [(accepted-after "DROP/**/INDEX ix_a ON t")
+         (accepted-after "-- note\nDROP INDEX ix_a ON t")]
+        [(after-override ["DROP/**/INDEX ix_a ON t"])
+         (after-override ["-- note\nDROP INDEX ix_a ON t"])])
+
+;; ... and a -- inside a delimited name is part of the name, not a comment: DROP INDEX [ix--a]
+;; ON t, read as written, drops ix__a, the catalog name of ix--a (accepted).
+(expect (accepted-after "DROP INDEX [ix--a] ON t")
+        (migrate-with-dependents [] {["t" "a"] ["ix__a"]} t-a-default [(overriding ["DROP INDEX [ix--a] ON t"])
+                                                                      (dropping :t :a)]))
 
 ;; ... while a drop written only inside a comment does not run and is not credited: inside a
 ;; comment that nests (its -- is part of the comment), or commented out before a drop of
@@ -1061,6 +1074,14 @@
          (migrate-over-catalog {:tables #{"t" "u"} :columns #{["t" "a"]}}
                                [{:drop-table :u} (adding-a)])])
 
+;; The table drop is read as the guards read it, behind a condition too: after an override that
+;; drops t if it exists and a create of t without a, the add is emitted.
+(expect ["IF OBJECT_ID('t') IS NOT NULL DROP TABLE t" "CREATE TABLE t (id INT NOT NULL)" "ALTER TABLE t ADD a INT"]
+        (migrate-over-catalog {:tables #{"t"} :columns #{["t" "a"]}}
+                              [(overriding "IF OBJECT_ID('t') IS NOT NULL DROP TABLE t")
+                               {:create-table :t :columns [[:id "INT" "NOT NULL"]]}
+                               (adding-a)]))
+
 ;; An earlier override's ALTER TABLE t DROP COLUMN a lets the add through; one that drops
 ;; another column of t, or a of another table, leaves it skipped.
 (expect [["ALTER TABLE t DROP COLUMN a" "ALTER TABLE t ADD a INT"]
@@ -1094,6 +1115,14 @@
                          {:alter-table "t" :drop-columns ["a"]}
                          {:alter-table :t :drop-columns [:b]}]]
                (:sql (migrate-with-dependents [] {} {} [drop (adding-a)])))))
+
+;; ... and so is the add: :A on :T, spelled in another case than its drop of :a on :t, is added,
+;; whether the drop is a later command's or the same command's.
+(expect [["ALTER TABLE t DROP column a" "ALTER TABLE T ADD A INT"]
+         ["ALTER TABLE T DROP column a" "ALTER TABLE T ADD A INT"]]
+        [(:sql (migrate-with-dependents [] {} {} [{:alter-table :t :drop-columns [:a]}
+                                                 {:alter-table :T :add-columns [[:A "INT"]]}]))
+         (:sql (migrate-with-dependents [] {} {} [{:alter-table :T :drop-columns [:a] :add-columns [[:A "INT"]]}]))])
 
 ;; A command with an override counts its :drop-columns key only where the override names the
 ;; column, as the other guards count a key: an override that renames t.a away lets the add
@@ -1318,10 +1347,10 @@
                                   {:create-index :ix_n :on :t :columns [:a]}
                                   (dropping :t :a)]))
 
-;; A {:drop-index i :on t} command's guard emits its DROP INDEX for an index an earlier command
-;; of the migration creates, though the catalog, read before the migration, holds no index of
-;; the name: the created index is dropped, and the column drop is accepted ...
-(expect (accepted-after "CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t")
+;; A {:drop-index i :on t} command's guard emits a DROP INDEX IF EXISTS for an index an earlier
+;; command of the migration creates, though the catalog, read before the migration, holds no
+;; index of the name: the created index is dropped, and the column drop is accepted ...
+(expect (accepted-after "CREATE  INDEX ix_n ON t (a)" "DROP INDEX IF EXISTS ix_n ON t")
         (migrate-with-dependents [] {} t-a-default [{:create-index :ix_n :on :t :columns [:a]}
                                                     {:drop-index :ix_n :on :t}
                                                     (dropping :t :a)]))
@@ -1356,13 +1385,13 @@
 
 ;; ---------------------------------------------------------------------------
 ;; The drop-index guard reads the plan's creates as the refusal does: a {:drop-index i :on t}
-;; emits its DROP INDEX when the catalog, read before the migration runs, shows the index, or
-;; when an earlier command of the migration creates it and no command between drops it again
-;; or drops its table.
+;; emits its DROP INDEX when the catalog, read before the migration runs, shows the index, and
+;; a DROP INDEX IF EXISTS when only an earlier command of the migration creates it and no
+;; command between is read to drop it again or drop its table.
 
 ;; The shape: over a catalog that holds no ix_n, a :create-index of ix_n and then a
-;; {:drop-index :ix_n :on :t} emit both statements.
-(expect ["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
+;; {:drop-index :ix_n :on :t} emit the create and the IF EXISTS drop.
+(expect ["CREATE  INDEX ix_n ON t (a)" "DROP INDEX IF EXISTS ix_n ON t"]
         (:sql (migrate-with-dependents [] {} {} [{:create-index :ix_n :on :t :columns [:a]} {:drop-index :ix_n :on :t}])))
 
 ;; A drop of an index neither the catalog nor the plan holds still emits nothing: alone, after
@@ -1374,17 +1403,18 @@
 
 ;; A create in an override or an :update counts as the refusal counts it, and the names
 ;; compare folded: a create of :IX-N on :T is the ix_n on t the drop names.
-(expect [["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
-         ["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
-         ["CREATE  INDEX IX_N ON T (a)" "DROP INDEX ix_n ON t"]]
+(expect [["CREATE INDEX ix_n ON t (a)" "DROP INDEX IF EXISTS ix_n ON t"]
+         ["CREATE INDEX ix_n ON t (a)" "DROP INDEX IF EXISTS ix_n ON t"]
+         ["CREATE  INDEX IX_N ON T (a)" "DROP INDEX IF EXISTS ix_n ON t"]]
         [(:sql (migrate-with-dependents [] {} {} [(overriding "CREATE INDEX ix_n ON t (a)") {:drop-index :ix_n :on :t}]))
          (:sql (migrate-with-dependents [] {} {} [{:update "CREATE INDEX ix_n ON t (a)"} {:drop-index :ix_n :on :t}]))
          (:sql (migrate-with-dependents [] {} {} [{:create-index :IX-N :on :T :columns [:a]} {:drop-index :ix_n :on :t}]))])
 
-;; Once a command after the create drops the index, a later {:drop-index} of it emits nothing:
-;; a first {:drop-index} of it (create, drop, drop again), an :alter-table's :drop-index key, a
-;; DROP INDEX in an override, or a drop of the table, each between the create and the drop.
-(expect [["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
+;; Once a command after the create is read to drop the index, a later {:drop-index} of it emits
+;; nothing: a first {:drop-index} of it (create, drop, drop again), an :alter-table's
+;; :drop-index key, a DROP INDEX in an override, or a drop of the table, each between the
+;; create and the drop.
+(expect [["CREATE  INDEX ix_n ON t (a)" "DROP INDEX IF EXISTS ix_n ON t"]
          ["CREATE  INDEX ix_n ON t (a)" "drop index if exists ix_n on t"]
          ["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
          ["CREATE  INDEX ix_n ON t (a)" "DROP TABLE t"]]
@@ -1407,6 +1437,42 @@
                                                  {:drop-index :ix_n :on :t}]))
          (:sql (migrate-with-dependents [] {["t" "b"] ["ix_n"]} {} [{:create-index :ix_n :on :t :columns [:a]}
                                                                    {:drop-index :ix_n :on :t}]))])
+
+;; A drop between that the plan does not read as one leaves the index counted, and the IF EXISTS
+;; makes the later drop a no-op where it would have failed (error 3701): the index created and
+;; dropped again inside one command, an override, an :update or a :create-index's override ...
+(expect [["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t" "DROP INDEX IF EXISTS ix_n ON t"]
+         ["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t" "DROP INDEX IF EXISTS ix_n ON t"]
+         ["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t" "DROP INDEX IF EXISTS ix_n ON t"]]
+        (vec (for [creating [(overriding ["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"])
+                             {:update ["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]}
+                             {:create-index :ix_n :on :t :columns [:a] :sqlserver ["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]}]]
+               (:sql (migrate-with-dependents [] {} {} [creating {:drop-index :ix_n :on :t}])))))
+
+;; ... or dropped between by a plain :update, or by an override string that holds a second
+;; statement after the drop.
+(expect [["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t" "DROP INDEX IF EXISTS ix_n ON t"]
+         ["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t; SELECT 1" "DROP INDEX IF EXISTS ix_n ON t"]]
+        (vec (for [between [{:update "DROP INDEX ix_n ON t"}
+                            (overriding "DROP INDEX ix_n ON t; SELECT 1")]]
+               (:sql (migrate-with-dependents [] {} {} [{:create-index :ix_n :on :t :columns [:a]}
+                                                        between
+                                                        {:drop-index :ix_n :on :t}])))))
+
+;; Through tern's own run-migration!: an override that creates ix_n on a and drops it again, a
+;; {:drop-index :ix_n :on :t}, then a drop of t.a: the column drop is accepted, and every
+;; statement runs, the version row included.
+(expect {:connected? true
+         :executed   ["CREATE INDEX ix_n ON t (a)"
+                      "DROP INDEX ix_n ON t"
+                      "DROP INDEX IF EXISTS ix_n ON t"
+                      column-and-default
+                      "INSERT INTO schema_versions (version,created) VALUES (20261015000000,CURRENT_TIMESTAMP)"]
+         :errors     []
+         :exit       nil}
+        (run-migration-offline {} t-a-default [(overriding ["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"])
+                                               {:drop-index :ix_n :on :t}
+                                               (dropping :t :a)]))
 
 ;; Without a connection nothing is refused: there is no catalog, and the generators emit
 ;; their statements unguarded.

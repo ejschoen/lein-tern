@@ -37,8 +37,9 @@
        no IF EXISTS statement; a, b, the default and both indexes gone, id and
        <t>_ix_id kept, the version row written (line DROP-COLUMNS-APPLIED);
     4. a :create-index of <t>_ci_ix_a on <t>_ci (a), then a {:drop-index
-       <t>_ci_ix_a :on <t>_ci} (version 4): both statements, the index gone
-       afterwards, the version row written (line DROP-INDEX-CREATED);
+       <t>_ci_ix_a :on <t>_ci} (version 4): the create and a DROP INDEX IF
+       EXISTS, the index gone afterwards, the version row written (line
+       DROP-INDEX-CREATED);
     5. a :drop-table of <t>_rc, a :create-table of it with id alone, then an
        :alter-table adding a (version 5): the three statements, a there
        afterwards, the version row written (line ADD-COLUMNS-AFTER-DROP-TABLE).
@@ -181,11 +182,12 @@
 
 (defn- created-index-statements
   "The statements the fourth migration's commands must execute, in order, the
-  version row's insert aside: the create of the index, then its drop."
+  version row's insert aside: the create of the index, then its drop, IF EXISTS
+  as the drop-index guard emits it for an index only the migration holds."
   [table]
   (let [{:keys [ci ci-ix]} (more-tables table)]
     [(format "CREATE  INDEX %s ON %s (a)" ci-ix ci)
-     (format "DROP INDEX %s ON %s" ci-ix ci)]))
+     (format "DROP INDEX IF EXISTS %s ON %s" ci-ix ci)]))
 
 (defn- recreated-statements
   "The statements the fifth migration's commands must execute, in order, the
@@ -422,7 +424,8 @@
                   (update :executed #(command-statements (:version-table result) %))))
 
       ;; 4. An index created and then dropped in one migration: the drop-index guard reads the
-      ;; create, so both statements run and the index is gone; the version recorded.
+      ;; create and emits DROP INDEX IF EXISTS, so both statements run and the index is gone; the
+      ;; version recorded.
       (expect {:exit nil :errors [] :executed (created-index-statements table) :indexes #{} :version-row true}
               {:exit        (:exit created-index)
                :errors      (:errors created-index)
