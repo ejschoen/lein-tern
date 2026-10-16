@@ -22,8 +22,10 @@
   lookup by capturing the query it sends.  The drop-index guard's reading of the
   plan's creates, a single-keyword :drop-constraints, the add-columns guard's
   reading of the plan's column and table drops, the whole ALTER TABLE ... DROP
-  list and comments in an override, a plain :update read as an override is, and
-  a single-keyword :drop-columns are checked over the same fake catalogs."
+  list and comments in an override, a plain :update read as an override is (and
+  a command holding an :update beside another command key read by the one it
+  runs), and a single-keyword :drop-columns are checked over the same fake
+  catalogs."
   (:require [tern.sqlserver    :as sqlserver]
             [tern.db           :as tern-db]
             [tern.log          :as log]
@@ -1502,7 +1504,7 @@
                                                (dropping :t :a)]))
 
 ;; ---------------------------------------------------------------------------
-;; A plain :update, a command without a :sqlserver override, runs its statements as written (the
+;; A plain :update, a command whose command key is :update, runs its statements as written (the
 ;; :update method hands them on, each string of a vector one statement), so the plan readers read
 ;; it as they read an override: the refusal and the drop-index guard count a statement that is the
 ;; drop alone (as-run), the other guards a drop anywhere in a statement (as-claimed).  A command
@@ -1616,6 +1618,118 @@
                                   [{:update "UPDATE t SET b = 1 WHERE 1 = 0" :sqlserver "DROP INDEX ix_a ON t"} (dropping :t :a)])
          (migrate-over-catalog {:columns #{["t" "a"]}}
                                [{:update "ALTER TABLE t DROP COLUMN a" :sqlserver "UPDATE t SET b = 1 WHERE 1 = 0"} (adding-a)])])
+
+;; The table reader through a plain :update reaches the other consumers of a table drop: after an
+;; :update that drops t, CREATE INDEX ix_t is emitted though the catalog shows it, and after one
+;; that drops u it is skipped ...
+(expect [[nil ["CREATE  INDEX ix_t ON t (a)"]] [nil nil]]
+        [(create-after [{:update "DROP TABLE t"}] :ix_t)
+         (create-after [{:update "DROP TABLE u"}] :ix_t)])
+
+;; ... fk_t is added again after an :update that drops t, and not after one that drops u ...
+(expect [[[] ["ALTER TABLE t ADD CONSTRAINT fk_t FOREIGN KEY (a) REFERENCES u(id)"]] [[] []]]
+        [(add-constraint-after [{:update "DROP TABLE t"}] :t [:fk_t] #{"fk_t"})
+         (add-constraint-after [{:update "DROP TABLE u"}] :t [:fk_t] #{"fk_t"})])
+
+;; ... and an index created on t counts as dropped with it, read as-run, so a later {:drop-index}
+;; of it emits nothing after an :update that drops t, while after one that drops u, or drops
+;; another index of t, it emits its DROP INDEX IF EXISTS.
+(expect [["CREATE  INDEX ix_n ON t (a)" "DROP TABLE t"]
+         ["CREATE  INDEX ix_n ON t (a)" "DROP TABLE u" "DROP INDEX IF EXISTS ix_n ON t"]
+         ["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_m ON t" "DROP INDEX IF EXISTS ix_n ON t"]]
+        (vec (for [between [{:update "DROP TABLE t"} {:update "DROP TABLE u"} {:update "DROP INDEX ix_m ON t"}]]
+               (:sql (migrate-with-dependents [] {} {} [{:create-index :ix_n :on :t :columns [:a]}
+                                                        between
+                                                        {:drop-index :ix_n :on :t}])))))
+
+;; ---------------------------------------------------------------------------
+;; A command that holds an :update beside another command key runs the first of the two in its key
+;; order alone (generate-sql dispatches on its command key), so the plan readers read it by the one
+;; that runs: by its keys when the other key comes first, its :update never running, and by its
+;; :update when the :update comes first, its keys never running.
+
+(defn- ordered
+  "A command of the key-value pairs `kvs` in the order written, as a migration file
+  read as EDN keeps the order of a map of up to eight keys."
+  [& kvs]
+  (apply array-map kvs))
+
+;; The refusal: with the key first, the key's drop of ix_a is credited (accepted) and the
+;; :update's is not (refused); with the :update first, the :update's drop is credited (accepted)
+;; and the key's is not (refused).
+(expect [(accepted-after "drop index if exists ix_a on t")
+         (refused-after "drop index if exists ix_c on t")
+         (accepted-after "DROP INDEX ix_a ON [t]")
+         (refused-after "UPDATE t SET b = 3 WHERE 1 = 0")]
+        (vec (for [mixed [(ordered :alter-table :t :drop-index [:ix_a] :update "UPDATE t SET b = 3 WHERE 1 = 0")
+                          (ordered :alter-table :t :drop-index [:ix_c] :update "DROP INDEX ix_a ON [t]")
+                          (ordered :update "DROP INDEX ix_a ON [t]" :alter-table :t :drop-index [:ix_c])
+                          (ordered :update "UPDATE t SET b = 3 WHERE 1 = 0" :alter-table :t :drop-index [:ix_a])]]
+               (migrate-with-dependents [] t-a-index t-a-default [mixed (dropping :t :a)]))))
+
+;; The create-table guard: with the key first, CREATE TABLE t follows a key that drops t and not
+;; an :update that does; with the :update first, the other way round.
+(expect [["DROP TABLE t" "CREATE TABLE t (a INT)"]
+         ["DROP TABLE u"]
+         ["drop table t" "CREATE TABLE t (a INT)"]
+         ["UPDATE u SET b = 3 WHERE 1 = 0"]]
+        (vec (for [mixed [(ordered :drop-table :t :update "UPDATE u SET b = 3 WHERE 1 = 0")
+                          (ordered :drop-table :u :update "drop table t")
+                          (ordered :update "drop table t" :drop-table :u)
+                          (ordered :update "UPDATE u SET b = 3 WHERE 1 = 0" :drop-table :t)]]
+               (migrate-over-catalog {:tables #{"t" "u"}} [mixed {:create-table :t :columns [[:a "INT"]]}]))))
+
+;; The create-index guard: with the key first, CREATE INDEX x follows a key that drops x and not
+;; an :update that does; with the :update first, the other way round.
+(expect [["DROP INDEX x ON t" "CREATE  INDEX x ON t (a)"]
+         ["DROP INDEX y ON t"]
+         ["DROP INDEX [x] ON t" "CREATE  INDEX x ON t (a)"]
+         ["UPDATE t SET b = 3 WHERE 1 = 0"]]
+        (vec (for [mixed [(ordered :drop-index :x :on :t :update "UPDATE t SET b = 3 WHERE 1 = 0")
+                          (ordered :drop-index :y :on :t :update "DROP INDEX [x] ON t")
+                          (ordered :update "DROP INDEX [x] ON t" :drop-index :y :on :t)
+                          (ordered :update "UPDATE t SET b = 3 WHERE 1 = 0" :drop-index :x :on :t)]]
+               (migrate-over-catalog {:tables #{"t"} :indexes #{["t" "x"] ["t" "y"]}}
+                                     [mixed {:create-index :x :on :t :columns [:a]}]))))
+
+;; The drop-index guard reads a drop between the same way: with the key first, a key that drops
+;; ix_n leaves the later {:drop-index} nothing to drop, and an :update that drops it leaves its DROP
+;; INDEX IF EXISTS; with the :update first, the other way round ...
+(expect [["CREATE  INDEX ix_n ON t (a)" "drop index if exists ix_n on t"]
+         ["CREATE  INDEX ix_n ON t (a)" "drop index if exists ix_m on t" "DROP INDEX IF EXISTS ix_n ON t"]
+         ["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON [t]"]
+         ["CREATE  INDEX ix_n ON t (a)" "UPDATE t SET b = 3 WHERE 1 = 0" "DROP INDEX IF EXISTS ix_n ON t"]]
+        (vec (for [mixed [(ordered :alter-table :t :drop-index [:ix_n] :update "UPDATE t SET b = 3 WHERE 1 = 0")
+                          (ordered :alter-table :t :drop-index [:ix_m] :update "DROP INDEX ix_n ON [t]")
+                          (ordered :update "DROP INDEX ix_n ON [t]" :alter-table :t :drop-index [:ix_m])
+                          (ordered :update "UPDATE t SET b = 3 WHERE 1 = 0" :alter-table :t :drop-index [:ix_n])]]
+               (:sql (migrate-with-dependents [] {} {} [{:create-index :ix_n :on :t :columns [:a]}
+                                                        mixed
+                                                        {:drop-index :ix_n :on :t}])))))
+
+;; ... and a create: with the key first, a :create-index of ix_n is read and an :update creating
+;; it is not; with the :update first, the other way round.
+(expect [["CREATE  INDEX ix_n ON t (a)" "DROP INDEX IF EXISTS ix_n ON t"]
+         ["CREATE  INDEX ix_m ON t (a)"]
+         ["CREATE INDEX ix_n ON t (a)" "DROP INDEX IF EXISTS ix_n ON t"]
+         ["UPDATE t SET b = 3 WHERE 1 = 0"]]
+        (vec (for [mixed [(ordered :create-index :ix_n :on :t :columns [:a] :update "UPDATE t SET b = 3 WHERE 1 = 0")
+                          (ordered :create-index :ix_m :on :t :columns [:a] :update "CREATE INDEX ix_n ON t (a)")
+                          (ordered :update "CREATE INDEX ix_n ON t (a)" :create-index :ix_m :on :t :columns [:a])
+                          (ordered :update "UPDATE t SET b = 3 WHERE 1 = 0" :create-index :ix_n :on :t :columns [:a])]]
+               (:sql (migrate-with-dependents [] {} {} [mixed {:drop-index :ix_n :on :t}])))))
+
+;; The add-columns guard: with the key first, an add of d follows a key that drops d and not an
+;; :update that does; with the :update first, the other way round.
+(expect [["ALTER TABLE t DROP column d" "ALTER TABLE t ADD d INT"]
+         ["ALTER TABLE t DROP column e"]
+         ["ALTER TABLE t DROP COLUMN d" "ALTER TABLE t ADD d INT"]
+         ["UPDATE t SET b = 3 WHERE 1 = 0"]]
+        (vec (for [mixed [(ordered :alter-table :t :drop-columns [:d] :update "UPDATE t SET b = 3 WHERE 1 = 0")
+                          (ordered :alter-table :t :drop-columns [:e] :update "ALTER TABLE t DROP COLUMN d")
+                          (ordered :update "ALTER TABLE t DROP COLUMN d" :alter-table :t :drop-columns [:e])
+                          (ordered :update "UPDATE t SET b = 3 WHERE 1 = 0" :alter-table :t :drop-columns [:d])]]
+               (:sql (migrate-with-dependents [] {} {} [mixed {:alter-table :t :add-columns [[:d "INT"]]}])))))
 
 ;; Without a connection nothing is refused: there is no catalog, and the generators emit
 ;; their statements unguarded.

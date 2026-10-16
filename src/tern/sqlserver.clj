@@ -56,8 +56,17 @@
                   :when (not (get ignore-options (:name option)))]
               (format "%s=%s" (:name option) (:value option))))))
 
+(defn- command-key
+  "The command key `command` is generated and run by: the first of its keys, in
+  the command's own key order, that names a supported command
+  (supported-commands).  A command holding two command keys runs the first
+  alone; a migration file read as EDN keeps the order its keys are written in
+  for a map of up to eight keys."
+  [command]
+  (some supported-commands (keys command)))
+
 (defmulti generate-sql
-  (fn [c] (some supported-commands (keys c))))
+  command-key)
 
 (def column-spec-map
   {"auto_increment" "identity"
@@ -336,12 +345,17 @@
 (defn- statement-carrier
   "The statements `command` runs on SQL Server in place of its own keys, or nil:
   its `:sqlserver` override when it has one, which run-migration! runs instead of
-  what generate-sql gives for the command, and otherwise its `:update`, which the
-  `:update` method hands on as written, each string one statement.  A command
-  with both runs the override alone, so its `:update` is not read.  The one place
-  the plan readers choose what a command is read by (as-run, as-claimed)."
+  what generate-sql gives for the command, and otherwise its `:update` when its
+  command key (command-key) is `:update`, a plain `:update`: generate-sql then
+  dispatches to the `:update` method, whose one result is the `:update` itself,
+  a string or a vector of strings that run-migration! flattens and runs one
+  statement per string.  A command whose command key is another one runs that
+  key's statements and is read by its keys, while an `:update` it also holds
+  never runs and is not read; a command with an override runs the override
+  alone, and its `:update` is not read either.  The one place the plan readers
+  choose what a command is read by (as-run, as-claimed)."
   [command]
-  (or (:sqlserver command) (:update command)))
+  (or (:sqlserver command) (when (= :update (command-key command)) (:update command))))
 
 (defn- as-run
   "What `read-override` finds in the statements `command` runs in place of its
@@ -362,13 +376,16 @@
   `:update`), matching each clause anywhere in a statement (anywhere), together
   with those claims of the command's own keys (`read-command`) whose object
   those statements name somewhere in their text (named-in); without either,
-  what the keys claim.  A plain `:update` has no keys that claim a drop, so it
-  counts by its statements alone.  The guards read the plan this way: a guard
-  that missed a drop would skip a create or an add the catalog still shows,
-  losing the object without a word, while one that counts a drop too many emits
-  a create or an add that fails when it runs.  A key whose object the override
-  never mentions is an instruction for another database, and SQL Server keeps
-  the object."
+  what the keys claim.  A plain `:update` with no other command key has no keys
+  that claim a drop, so it counts by its statements alone; one held beside
+  another command key also counts that key's claims whose object its
+  statements name, as a command with an override does.  The guards read the
+  plan this way: a guard that missed a drop would skip a create or an add the
+  catalog still shows, losing the object without a word, while one that counts
+  a drop too many emits a create or an add that fails when it runs.  A key
+  whose object those statements never mention is an instruction for another
+  database, or one that never runs beside a plain `:update`, and SQL Server
+  keeps the object."
   [command read-override read-command]
   (if-let [carrier (statement-carrier command)]
     (let [named (named-in carrier)]
@@ -593,11 +610,11 @@
 (defn- created-indexes
   "The indexes `command` creates (as-run) when the commands `earlier` come before
   it, each [table index columns] as clause-created-indexes gives them.  A
-  `:sqlserver` override, or an `:update` without one, creates what the CREATE
-  INDEX clauses anywhere in its statements create.  A `{:create-index i :on t :columns
-  [...]}` creates i over its columns, each without the (n) prefix length the
-  generator strips or a trailing ASC or DESC, unless its guard skips it
-  (create-index-skipped?)."
+  `:sqlserver` override, or a plain `:update` without one (statement-carrier),
+  creates what the CREATE INDEX clauses anywhere in its statements create.  A
+  `{:create-index i :on t :columns [...]}` creates i over its columns, each
+  without the (n) prefix length the generator strips or a trailing ASC or DESC,
+  unless its guard skips it (create-index-skipped?)."
   [earlier command]
   (as-run command
           (fn [_ override] (clause-created-indexes (statement-strings override)))
@@ -614,12 +631,12 @@
   later command in `plan` drops, in plan order, each [index columns] as
   created-indexes gives them.  A later drop is a DROP INDEX of the index on the
   table in an override or a plain `:update`, the `:drop-index` key of an
-  `:alter-table` of the table,
-  a `{:drop-index i :on t}` command, or a drop of the whole table, each read
-  as-run.  A `{:drop-index i :on t}` counts by its key: its guard emits a DROP
-  INDEX IF EXISTS for an index an earlier command creates and nothing between
-  drops again (plan-created-index?), so the index is gone after it, whether or
-  not it was there, and counting it credits no drop that does not happen."
+  `:alter-table` of the table, a `{:drop-index i :on t}` command, or a drop of
+  the whole table, each read as-run.  A `{:drop-index i :on t}` counts by its
+  key: its guard emits a DROP INDEX IF EXISTS for an index an earlier command
+  creates and nothing between drops again (plan-created-index?), so the index
+  is gone after it, whether or not it was there, and counting it credits no
+  drop that does not happen."
   [plan table]
   (let [plan (vec plan)]
     (for [position         (range (count plan))
@@ -643,9 +660,9 @@
   that did not run, or a drop between in a form not read as one: inside the
   creating command itself, behind a condition, in a statement that holds more
   than the drop), and the IF EXISTS makes that drop a no-op rather than error
-  3701.  The side left is silent: a create written in a
-  form not read (dynamic SQL that does not spell the statement, say) is missed,
-  its drop skipped, and the index stays on the table without a word."
+  3701.  The side left is silent: a create written in a form not read (dynamic
+  SQL that does not spell the statement, say) is missed, its drop skipped, and
+  the index stays on the table without a word."
   [plan table index]
   (boolean (some (fn [[created _]] (= (folded-name created) (folded-name index)))
                  (plan-created-indexes plan (folded-name table)))))
@@ -677,10 +694,10 @@
   (plan-created-indexes).  A catalog index counts as dropped first when an
   earlier {:drop-index i :on table} command or :alter-table :drop-index key, a
   DROP INDEX ... ON table statement of an earlier :sqlserver override or plain
-  :update, or this
-  command's own :drop-index key (`own-drops`) names it (plan-dropped-indexes), or
-  when an earlier command drops the whole table (plan-dropped-tables); a created
-  one when a command after its create, this command's own key included, drops it.
+  :update, or this command's own :drop-index key (`own-drops`) names it
+  (plan-dropped-indexes), or when an earlier command drops the whole table
+  (plan-dropped-tables); a created one when a command after its create, this
+  command's own key included, drops it.
   The plan is read as-run; names are compared folded (folded-name).  Indexes
   that back a primary key or a unique constraint are not looked up here: they
   are constraints, dropped before the column with its other constraints."
