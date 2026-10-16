@@ -333,40 +333,55 @@
   [claim]
   (if (vector? claim) (peek claim) claim))
 
+(defn- statement-carrier
+  "The statements `command` runs on SQL Server in place of its own keys, or nil:
+  its `:sqlserver` override when it has one, which run-migration! runs instead of
+  what generate-sql gives for the command, and otherwise its `:update`, which the
+  `:update` method hands on as written, each string one statement.  A command
+  with both runs the override alone, so its `:update` is not read.  The one place
+  the plan readers choose what a command is read by (as-run, as-claimed)."
+  [command]
+  (or (:sqlserver command) (:update command)))
+
 (defn- as-run
-  "What `read-override` finds in the `:sqlserver` override of `command` when it
-  has one, matching each clause as a whole statement (whole-statement), and
+  "What `read-override` finds in the statements `command` runs in place of its
+  keys (statement-carrier: its `:sqlserver` override, or else a plain
+  `:update`), matching each clause as a whole statement (whole-statement), and
   otherwise what `read-command` finds in the command: run-migration! runs an
   override in place of the command's own keys, so those keys do nothing on SQL
   Server and are not read.  The column-drop refusal reads the plan this way: a
-  drop not read in an override leaves the refusal, the safe side."
+  drop not read in an override or an `:update` leaves the refusal, the safe side."
   [command read-override read-command]
-  (if-let [override (:sqlserver command)]
-    (read-override whole-statement override)
+  (if-let [carrier (statement-carrier command)]
+    (read-override whole-statement carrier)
     (read-command command)))
 
 (defn- as-claimed
-  "What `read-override` finds in the `:sqlserver` override of `command` when it
-  has one, matching each clause anywhere in a statement (anywhere), together with
-  those claims of the command's own keys (`read-command`) whose object the
-  override names somewhere in its text (named-in); without an override, what
-  the keys claim.  The guards read the plan this way: a guard that missed a drop
-  would skip a create or an add the catalog still shows, losing the object
-  without a word, while one that counts a drop too many emits a create or an
-  add that fails when it runs.  A key whose object the override never mentions
-  is an instruction for another database, and SQL Server keeps the object."
+  "What `read-override` finds in the statements `command` runs in place of its
+  keys (statement-carrier: its `:sqlserver` override, or else a plain
+  `:update`), matching each clause anywhere in a statement (anywhere), together
+  with those claims of the command's own keys (`read-command`) whose object
+  those statements name somewhere in their text (named-in); without either,
+  what the keys claim.  A plain `:update` has no keys that claim a drop, so it
+  counts by its statements alone.  The guards read the plan this way: a guard
+  that missed a drop would skip a create or an add the catalog still shows,
+  losing the object without a word, while one that counts a drop too many emits
+  a create or an add that fails when it runs.  A key whose object the override
+  never mentions is an instruction for another database, and SQL Server keeps
+  the object."
   [command read-override read-command]
-  (if-let [override (:sqlserver command)]
-    (let [named (named-in override)]
-      (concat (read-override anywhere override)
+  (if-let [carrier (statement-carrier command)]
+    (let [named (named-in carrier)]
+      (concat (read-override anywhere carrier)
               (filter #(contains? named (claimed-object %)) (read-command command))))
     (read-command command)))
 
 (defn- override-dropped-indexes
   "The [table index] pairs, folded (folded-name), that the DROP INDEX clauses in
-  the statements of a `:sqlserver` override drop, each clause found by `match`
-  (whole-statement or anywhere), every drop of its list.  A DROP INDEX naming no
-  table drops nothing here."
+  the statements of a `:sqlserver` override or a plain `:update`
+  (statement-carrier) drop, each clause found by `match` (whole-statement or
+  anywhere), every drop of its list.  A DROP INDEX naming no table drops nothing
+  here."
   [match override]
   (for [statement (statement-strings override)
         [_ drops] (match drop-index-clause statement)
@@ -378,9 +393,19 @@
   "The [table index] pairs, folded (folded-name), that the commands in `plan`
   drop: a `{:drop-index i :on t}` command, or the `:drop-index` key of an
   `:alter-table` (one index, or a collection of them), and for a command with a
-  `:sqlserver` override the DROP INDEX statements the override holds, read by
-  `reading` (as-run or as-claimed).  A `:drop-index` command without `:on` names
-  no table and is left out."
+  `:sqlserver` override, or a plain `:update` without one, the DROP INDEX
+  statements those hold, read by `reading` (as-run or as-claimed).  A
+  `:drop-index` command without `:on` names no table and is left out.  Reading
+  a plain `:update` as an override is read moves the credit only upwards, and
+  only by drops its statements make, for each consumer on its safe side: the
+  create-index guard reads as-claimed, where an index counted as dropped too
+  often makes its CREATE fail when it runs, while one missed would skip the
+  create and lose the index without a word; the column-drop refusal and the
+  drop-index guard read as-run (plan-created-indexes), crediting only a
+  statement that is the drop alone, which has run when the commands after it
+  run, so the column drop meets no error 5074 and the DROP INDEX skipped had
+  nothing left to drop, while a drop they miss only refuses a column drop or
+  leaves a DROP INDEX IF EXISTS that does nothing."
   [reading plan]
   (set (mapcat (fn [command]
                  (reading command
@@ -411,8 +436,8 @@
 (defn- override-dropped-items
   "The [table name] pairs, folded (folded-name), of the items of kind `kind`
   (drop-list-items) that the ALTER TABLE ... DROP clauses in the statements of a
-  `:sqlserver` override drop, each clause found by `match` (whole-statement or
-  anywhere)."
+  `:sqlserver` override or a plain `:update` drop, each clause found by `match`
+  (whole-statement or anywhere)."
   [kind match override]
   (for [statement (statement-strings override)
         [_ table items] (match alter-table-drop-clause statement)
@@ -422,33 +447,39 @@
 
 (defn- override-dropped-constraints
   "The [table constraint] pairs, folded (folded-name), that the ALTER TABLE ...
-  DROP clauses in the statements of a `:sqlserver` override drop, each clause
-  found by `match` (whole-statement or anywhere), every constraint of its whole
-  list: one after a COLUMN item or after a WITH (...) counts too.  Reading the
-  whole list moves the credit only upwards, and only by drops the statement
-  makes: the add-constraints guard reads it as-claimed, where a constraint
-  counted as dropped too often makes its ADD fail when it runs, while one missed
-  would skip the add and lose the constraint without a word."
+  DROP clauses in the statements of a `:sqlserver` override or a plain `:update`
+  drop, each clause found by `match` (whole-statement or anywhere), every
+  constraint of its whole list: one after a COLUMN item or after a WITH (...)
+  counts too.  Reading the whole list moves the credit only upwards, and only by
+  drops the statement makes: the add-constraints guard reads it as-claimed,
+  where a constraint counted as dropped too often makes its ADD fail when it
+  runs, while one missed would skip the add and lose the constraint without a
+  word."
   [match override]
   (override-dropped-items :constraint match override))
 
 (defn- override-dropped-columns
   "The [table column] pairs, folded (folded-name), that the ALTER TABLE ... DROP
-  clauses in the statements of a `:sqlserver` override drop, each clause found by
-  `match` (whole-statement or anywhere): the COLUMN items of the whole list.  The
-  add-columns guard reads it as-claimed, where a column counted as dropped too
-  often makes its ADD fail when it runs (the column is still there), while one
-  missed would skip the add and lose the column without a word."
+  clauses in the statements of a `:sqlserver` override or a plain `:update`
+  drop, each clause found by `match` (whole-statement or anywhere): the COLUMN
+  items of the whole list.  The add-columns guard reads it as-claimed, where a
+  column counted as dropped too often makes its ADD fail when it runs (the
+  column is still there), while one missed would skip the add and lose the
+  column without a word."
   [match override]
   (override-dropped-items :column match override))
 
 (defn- plan-dropped-constraints
   "The [table constraint] pairs, folded (folded-name), that the commands in
   `plan` drop: the `:drop-constraints` key of an `:alter-table` (a collection of
-  constraints, or one), and for a command with a `:sqlserver` override the
-  constraint items of the ALTER TABLE ... DROP statements the override holds
-  (override-dropped-constraints, the whole list), read by `reading` (as-run or
-  as-claimed)."
+  constraints, or one), and for a command with a `:sqlserver` override, or a
+  plain `:update` without one, the constraint items of the ALTER TABLE ... DROP
+  statements those hold (override-dropped-constraints, the whole list), read by
+  `reading` (as-run or as-claimed).  Reading a plain `:update` as an override is
+  read moves the credit only upwards, and only by drops its statements make: the
+  one consumer, the add-constraints guard, reads as-claimed, where a constraint
+  counted as dropped too often makes its ADD fail when it runs, while one missed
+  would skip the add and lose the constraint without a word."
   [reading plan]
   (set (mapcat (fn [command]
                  (reading command
@@ -462,13 +493,16 @@
 (defn- plan-dropped-columns
   "The [table column] pairs, folded (folded-name), that the commands in `plan`
   drop: the `:drop-columns` key of an `:alter-table` (a collection of columns, or
-  one), and for a command with a `:sqlserver` override the COLUMN items of the
-  ALTER TABLE ... DROP statements the override holds (override-dropped-columns),
-  read by `reading` (as-run or as-claimed).  Its one consumer, the add-columns
-  guard (plan-drops-column?), reads it as-claimed, crediting a drop more often
-  rather than less: a column counted as dropped too often makes its ADD fail when
+  one), and for a command with a `:sqlserver` override, or a plain `:update`
+  without one, the COLUMN items of the ALTER TABLE ... DROP statements those hold
+  (override-dropped-columns), read by `reading` (as-run or as-claimed).  Its one
+  consumer, the add-columns guard (plan-drops-column?), reads it as-claimed,
+  crediting a drop more often rather than less, and reading a plain `:update` as
+  an override is read moves that credit further upwards, only by drops its
+  statements make: a column counted as dropped too often makes its ADD fail when
   it runs, while one missed would skip the add and lose the column without a
-  word."
+  word, as a column an `:update` dropped and an `:alter-table` added again was
+  lost before."
   [reading plan]
   (set (mapcat (fn [command]
                  (reading command
@@ -481,8 +515,8 @@
 
 (defn- override-dropped-tables
   "The tables, folded (folded-name), that the DROP TABLE clauses in the
-  statements of a `:sqlserver` override drop, each clause found by `match`
-  (whole-statement or anywhere), every table of its list."
+  statements of a `:sqlserver` override or a plain `:update` drop, each clause
+  found by `match` (whole-statement or anywhere), every table of its list."
   [match override]
   (for [statement (statement-strings override)
         [_ tables] (match drop-table-clause statement)
@@ -491,11 +525,21 @@
 
 (defn- plan-dropped-tables
   "The tables, folded (folded-name), that the commands in `plan` drop: a
-  `{:drop-table t}` command, and for a command with a `:sqlserver` override the
-  DROP TABLE statements the override holds, read by `reading` (as-run or
-  as-claimed).  Dropping a table drops every index and constraint on it, so a
-  later `:create-index` or `:add-constraints` on a table of this set is emitted
-  even though the catalog, read before anything runs, still shows the old one."
+  `{:drop-table t}` command, and for a command with a `:sqlserver` override, or a
+  plain `:update` without one, the DROP TABLE statements those hold, read by
+  `reading` (as-run or as-claimed).  Dropping a table drops every index and
+  constraint on it, so a later `:create-index` or `:add-constraints` on a table
+  of this set is emitted even though the catalog, read before anything runs,
+  still shows the old one.  Reading a plain `:update` as an override is read
+  moves the credit only upwards, and only by drops its statements make, for each
+  consumer on its safe side: the create-table, create-index, add-constraints and
+  add-columns guards read as-claimed, where a table counted as dropped too often
+  makes the create or add fail when it runs, while one missed would skip it and
+  lose the table, index, constraint or column without a word; the column-drop
+  refusal and the drop-index guard read as-run, crediting only a statement that
+  is the drop alone, which has run when the commands after it run, while a drop
+  they miss only refuses a column drop or leaves a DROP INDEX IF EXISTS that
+  does nothing."
   [reading plan]
   (set (mapcat (fn [command]
                  (reading command
@@ -557,20 +601,20 @@
   [earlier command]
   (as-run command
           (fn [_ override] (clause-created-indexes (statement-strings override)))
-          (fn [{index :create-index table :on columns :columns update :update}]
-            (concat (when (and index table (not (create-index-skipped? earlier table index)))
-                      [[(folded-name table)
-                        (catalog-name index)
-                        (set (for [column columns]
-                               (folded-name (s/replace (second (re-matches #"([^()]+)(?:\(\d+\))?" (name column)))
-                                                       #"(?i)\s+(?:ASC|DESC)$" ""))))]])
-                    (clause-created-indexes (statement-strings update))))))
+          (fn [{index :create-index table :on columns :columns}]
+            (when (and index table (not (create-index-skipped? earlier table index)))
+              [[(folded-name table)
+                (catalog-name index)
+                (set (for [column columns]
+                       (folded-name (s/replace (second (re-matches #"([^()]+)(?:\(\d+\))?" (name column)))
+                                               #"(?i)\s+(?:ASC|DESC)$" ""))))]]))))
 
 (defn- plan-created-indexes
   "The indexes on `table` (folded) that the commands in `plan` create and no
   later command in `plan` drops, in plan order, each [index columns] as
   created-indexes gives them.  A later drop is a DROP INDEX of the index on the
-  table in an override, the `:drop-index` key of an `:alter-table` of the table,
+  table in an override or a plain `:update`, the `:drop-index` key of an
+  `:alter-table` of the table,
   a `{:drop-index i :on t}` command, or a drop of the whole table, each read
   as-run.  A `{:drop-index i :on t}` counts by its key: its guard emits a DROP
   INDEX IF EXISTS for an index an earlier command creates and nothing between
@@ -594,11 +638,12 @@
   migration runs, does not show the index, and on its yes emits DROP INDEX IF
   EXISTS.  It errs towards the index being there: it reads creates generously (a
   create in a comment, a string or behind a condition counts) and a drop between
-  only as a whole statement of an override or a key (as-run), so it can say yes
-  for an index that is not there when the drop runs (a create that did not run,
-  or a drop between in a form not read as one: inside the creating command
-  itself, in an :update, behind a condition), and the IF EXISTS makes that drop a
-  no-op rather than error 3701.  The side left is silent: a create written in a
+  only as a whole statement of an override, a plain :update or a key (as-run),
+  so it can say yes for an index that is not there when the drop runs (a create
+  that did not run, or a drop between in a form not read as one: inside the
+  creating command itself, behind a condition, in a statement that holds more
+  than the drop), and the IF EXISTS makes that drop a no-op rather than error
+  3701.  The side left is silent: a create written in a
   form not read (dynamic SQL that does not spell the statement, say) is missed,
   its drop skipped, and the index stays on the table without a word."
   [plan table index]
@@ -630,8 +675,9 @@
   (get-column-indexes, read while the migration's SQL is generated) and, with a
   connection, those an earlier command of the migration creates
   (plan-created-indexes).  A catalog index counts as dropped first when an
-  earlier {:drop-index i :on table} command or :alter-table :drop-index key, an
-  earlier :sqlserver override's DROP INDEX ... ON table statement, or this
+  earlier {:drop-index i :on table} command or :alter-table :drop-index key, a
+  DROP INDEX ... ON table statement of an earlier :sqlserver override or plain
+  :update, or this
   command's own :drop-index key (`own-drops`) names it (plan-dropped-indexes), or
   when an earlier command drops the whole table (plan-dropped-tables); a created
   one when a command after its create, this command's own key included, drops it.
@@ -673,6 +719,8 @@
         drop-indices (if (or (nil? drop-indices) (coll? drop-indices)) drop-indices [drop-indices])
         ;; So may :drop-constraints name one constraint (or :primary-key).
         drop-constraints (if (or (nil? drop-constraints) (coll? drop-constraints)) drop-constraints [drop-constraints])
+        ;; And :drop-columns one column.
+        drop-columns (if (or (nil? drop-columns) (coll? drop-columns)) drop-columns [drop-columns])
         ;; The plan an add reads: the earlier commands, then this command's own :drop-columns,
         ;; whose DROP tern emits before the ADD.
         add-plan (concat (if *plan* @*plan* []) [{:alter-table table :drop-columns drop-columns}])
