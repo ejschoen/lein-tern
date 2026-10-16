@@ -1,6 +1,11 @@
 (ns tern.sqlserver-drop-columns-live-test
-  "tern's SQL Server `:drop-columns` against a real SQL Server: the indexes and
-  the default constraint that depend on a column are dropped before the column.
+  "tern's SQL Server `:drop-columns` against a real SQL Server: a migration whose
+  column drop meets an index that still contains the column is refused before any
+  of its statements runs, and one that drops those indexes first runs whole; and
+  two guards that read the migration's own earlier commands: an index the
+  migration creates is dropped by its {:drop-index}, and a column the migration
+  adds after dropping and creating its table again, or after a plain :update
+  drops it, is added.
 
   Runs only when TERN_SQLSERVER_HOST is non-blank and
   TERN_SQLSERVER_SCRATCH_DATABASE names a scratch database,
@@ -12,25 +17,44 @@
   TERN_SQLSERVER_DATABASE.
 
   It writes, in the scratch database only, and only after SELECT DB_NAME()
-  confirms that is where it is connected: it creates a table
-  tern_dc_<UTC yyyyMMddHHmmss> (id INT NOT NULL, a VARCHAR(10) NULL, b INT NULL
-  DEFAULT 0) with two indexes on a, (a) and (a, id), and one on (id, b), checks
-  that those four dependents exist, binds `*db*` to the scratch database and
-  `*plan*` to an empty plan, runs `generate-sql` for `:drop-columns [:a :b]`,
-  executes every statement in order, and reads the catalog: a, b, the three
-  indexes and the default must be gone, the table and its column id still
-  there.  tern's statements run through tern's own executor
-  (execute-statement!, Statement.execute).  It prints one DROP-COLUMNS-LIVE
-  line.  A second table, the same with the suffix _r, runs the same way except
-  that between tern generating its statements and their execution the test
-  re-creates _a2_idx on (id) alone and _a_idx on (b): tern's statements must
-  leave _a2_idx and drop _a_idx, and the line is DROP-COLUMNS-LIVE-REDEFINED.  A table is kept (the line ends table-kept)
-  unless TERN_SCRATCH_DROP_TABLE is true and every check on it passed; then the
-  test drops that table (table-dropped).  It never
-  creates or drops a database.  Nothing it prints carries the login or the
-  password."
+  confirms that is where it is connected.  It creates a table
+  <t> = tern_dc_<UTC yyyyMMddHHmmss> (id INT NOT NULL, a VARCHAR(10) NULL, b INT
+  NULL DEFAULT 0) whose column a is in two indexes, <t>_ix_a (a) and <t>_ix_a_id
+  (a, id), with a third index, <t>_ix_id (id), and a version table <t>_versions
+  made by tern's own create-version-table, and three more tables, <t>_ci, <t>_rc
+  and <t>_ud, each (id INT NOT NULL, a INT NULL).  Then it runs six migrations through
+  tern's SqlServerMigrator, as a migrate does, with tern's exit trapped (a stub
+  that records the status and throws, as System/exit never returns) and the lines
+  tern logs as errors and the statements it executes recorded:
+
+    1. :drop-columns [:a :b] alone (version 1): refused, one line for each of a's
+       two indexes; nothing executed, the catalog as before, no version row
+       (lines DROP-COLUMNS-REFUSED and DROP-COLUMNS-UNCHANGED);
+    2. {:drop-index <t>_ix_a} then the same :drop-columns (version 2): refused for
+       <t>_ix_a_id; nothing executed, so <t>_ix_a is still there, and no version
+       row (line DROP-COLUMNS-FIRST-COMMAND);
+    3. both :drop-index commands, then the :drop-columns (version 3): the two
+       DROP INDEX statements and the column drop with its default, nothing else,
+       no IF EXISTS statement; a, b, the default and both indexes gone, id and
+       <t>_ix_id kept, the version row written (line DROP-COLUMNS-APPLIED);
+    4. a :create-index of <t>_ci_ix_a on <t>_ci (a), then a {:drop-index
+       <t>_ci_ix_a :on <t>_ci} (version 4): the create and a DROP INDEX IF
+       EXISTS, the index gone afterwards, the version row written (line
+       DROP-INDEX-CREATED);
+    5. a :drop-table of <t>_rc, a :create-table of it with id alone, then an
+       :alter-table adding a (version 5): the three statements, a there
+       afterwards, the version row written (line ADD-COLUMNS-AFTER-DROP-TABLE);
+    6. a plain :update dropping a of <t>_ud, then an :alter-table adding a
+       (version 6): both statements, a there afterwards, the version row
+       written (line ADD-COLUMNS-AFTER-UPDATE-DROP).
+
+  When every check passed it drops its five tables (tables-dropped);
+  otherwise it keeps them for inspection (tables-kept) and prints what it found.
+  It never creates or drops a database.  Nothing it prints carries the login or
+  the password."
   (:require [tern.sqlserver    :as sqlserver]
-            [tern.db           :refer [db-spec]]
+            [tern.db           :as tern-db :refer [db-spec]]
+            [tern.log          :as log]
             [clojure.java.jdbc :as jdbc]
             [clojure.string    :as s]
             [expectations      :refer :all])
@@ -102,58 +126,196 @@
                               " JOIN sys.objects o ON o.object_id = d.parent_object_id WHERE o.name = ?")
                     table)})
 
-(defn- expected-before
+(defn- versions
+  "The versions recorded in the version table `vt`."
+  [conn vt]
+  (names conn (str "SELECT version AS n FROM " vt)))
+
+(defn- index-names
   [table]
-  {:tables   #{table}
-   :columns  #{"id" "a" "b"}
-   :indexes  #{(str table "_a_idx") (str table "_a2_idx") (str table "_id_b_idx")}
-   :defaults 1})
+  {:a    (str table "_ix_a")
+   :a-id (str table "_ix_a_id")
+   :id   (str table "_ix_id")})
 
-(defn- expected-after
-  "What must be left: the table and id; no index, no default.  In the redefined
-  scenario _a2_idx, re-created on (id) alone after tern generated its statements,
-  must survive with that definition."
-  [table redefined?]
-  (cond-> {:tables   #{table}
-           :columns  #{"id"}
-           :indexes  #{}
-           :defaults #{}}
-    redefined? (assoc :indexes #{(str table "_a2_idx")}
-                      :a2-columns #{"id"})))
-
-(defn- index-columns
-  [conn table index]
-  (names conn (str "SELECT c.name AS n FROM sys.indexes i"
-                   " JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id"
-                   " JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id"
-                   " JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = ? AND i.name = ?")
-         table index))
+(defn- expected-before
+  "The catalog the test builds; the default's name is the server's, so it is counted."
+  [table]
+  (let [ix (index-names table)]
+    {:tables   #{table}
+     :columns  #{"id" "a" "b"}
+     :indexes  #{(:a ix) (:a-id ix) (:id ix)}
+     :defaults 1}))
 
 (defn- before-summary
   [{:keys [before]}]
   (when before
     (update before :defaults count)))
 
+(defn- expected-after-applied
+  "What the third migration must leave: the table, id and the index on id."
+  [table]
+  {:tables   #{table}
+   :columns  #{"id"}
+   :indexes  #{(:id (index-names table))}
+   :defaults #{}})
+
+(defn- refusal
+  "The line tern logs when `column` of `table` cannot be dropped because `index`
+  still contains it."
+  [table column index]
+  (str "tern: cannot drop column " table "." column " on SQL Server: index " index " still contains it;"
+       " drop the index first in this migration (:drop-index), or remove a stale index by hand"
+       " (see the SQL Server migration runbook, section 5a)"))
+
+(defn- applied-statements
+  "The statements the third migration's commands must execute, in order, the
+  version row's insert aside: the two index drops, then the default and the
+  columns in one statement."
+  [table default]
+  (let [ix (index-names table)]
+    [(format "DROP INDEX %s ON %s" (:a ix) table)
+     (format "DROP INDEX %s ON %s" (:a-id ix) table)
+     (format "ALTER TABLE %s DROP constraint if exists %s, column a,b" table default)]))
+
+(defn- more-tables
+  "The tables and the index of migrations 4, 5 and 6."
+  [table]
+  {:ci    (str table "_ci")
+   :ci-ix (str table "_ci_ix_a")
+   :rc    (str table "_rc")
+   :ud    (str table "_ud")})
+
+(defn- created-index-statements
+  "The statements the fourth migration's commands must execute, in order, the
+  version row's insert aside: the create of the index, then its drop, IF EXISTS
+  as the drop-index guard emits it for an index only the migration holds."
+  [table]
+  (let [{:keys [ci ci-ix]} (more-tables table)]
+    [(format "CREATE  INDEX %s ON %s (a)" ci-ix ci)
+     (format "DROP INDEX IF EXISTS %s ON %s" ci-ix ci)]))
+
+(defn- recreated-statements
+  "The statements the fifth migration's commands must execute, in order, the
+  version row's insert aside: the table dropped, created again with id alone,
+  and a added."
+  [table]
+  (let [{:keys [rc]} (more-tables table)]
+    [(format "DROP TABLE %s" rc)
+     (format "CREATE TABLE %s (id INT NOT NULL)" rc)
+     (format "ALTER TABLE %s ADD a INT NULL" rc)]))
+
+(defn- update-drop-statements
+  "The statements the sixth migration's commands must execute, in order, the
+  version row's insert aside: the :update's column drop as written, then a
+  added again."
+  [table]
+  (let [{:keys [ud]} (more-tables table)]
+    [(format "ALTER TABLE %s DROP COLUMN a" ud)
+     (format "ALTER TABLE %s ADD a INT NULL" ud)]))
+
+(defn- command-statements
+  "What a run executed, the version row's insert into `vt` aside."
+  [vt executed]
+  (vec (remove #(s/starts-with? % (str "INSERT INTO " vt " ")) executed)))
+
+(defn- migrate!
+  "Runs `commands` as `version` through tern's SqlServerMigrator on the scratch
+  database, `vt` its version table, with tern's exit trapped and every line tern
+  logs as an error (still printed) and every statement it executes (still
+  executed) recorded.  Returns {:exit the status of a requested exit, or nil,
+  :errors [...], :executed [...]}; anything else tern throws propagates."
+  [db vt version commands]
+  (let [exit         (atom nil)
+        errors       (atom [])
+        executed     (atom [])
+        real-error   log/error
+        real-execute @#'sqlserver/execute-statement!]
+    (with-redefs-fn {#'sqlserver/exit!             (fn [status]
+                                                     (reset! exit status)
+                                                     (throw (ex-info "tern requested its exit" {::exit status})))
+                     #'log/error                   (fn [& args]
+                                                     (swap! errors conj (s/join " " args))
+                                                     (apply real-error args))
+                     #'sqlserver/execute-statement! (fn [conn sql]
+                                                      (swap! executed conj sql)
+                                                      (real-execute conn sql))}
+      (fn []
+        (try
+          (tern-db/migrate (sqlserver/->SqlServerMigrator {:db db :version-table vt}) version commands)
+          (catch clojure.lang.ExceptionInfo e
+            (when-not (contains? (ex-data e) ::exit)
+              (throw e))))))
+    {:exit @exit :errors @errors :executed @executed}))
+
+(defn- checks
+  "Each check's verdict on `result`."
+  [{:keys [table version-table before refused first-command applied created-index recreated update-drop]}]
+  (let [ix      (index-names table)
+        more    (more-tables table)
+        default (first (:defaults before))]
+    {:before        (= (expected-before table) (when before (update before :defaults count)))
+     :refused       (and (= 1 (:exit refused))
+                         (= 2 (count (:errors refused)))
+                         (= #{(refusal table "a" (:a ix)) (refusal table "a" (:a-id ix))}
+                            (set (:errors refused))))
+     :unchanged     (and (some? refused)
+                         (= [] (:executed refused))
+                         (= before (:after refused))
+                         (= #{} (:versions refused)))
+     :first-command (and (= 1 (:exit first-command))
+                         (= [(refusal table "a" (:a-id ix))] (:errors first-command))
+                         (= [] (:executed first-command))
+                         (= before (:after first-command))
+                         (= #{} (:versions first-command)))
+     :applied       (and (some? applied)
+                         (nil? (:exit applied))
+                         (= [] (:errors applied))
+                         (= (applied-statements table default) (command-statements version-table (:executed applied)))
+                         (not-any? #(s/includes? % "IF EXISTS") (:executed applied))
+                         (= (expected-after-applied table) (:after applied))
+                         (= #{"3"} (:versions applied)))
+     :created-index (and (some? created-index)
+                         (nil? (:exit created-index))
+                         (= [] (:errors created-index))
+                         (= (created-index-statements table) (command-statements version-table (:executed created-index)))
+                         (= #{(:ci more)} (:tables (:after created-index)))
+                         (= #{} (:indexes (:after created-index)))
+                         (contains? (:versions created-index) "4"))
+     :recreated     (and (some? recreated)
+                         (nil? (:exit recreated))
+                         (= [] (:errors recreated))
+                         (= (recreated-statements table) (command-statements version-table (:executed recreated)))
+                         (= #{"id" "a"} (:columns (:after recreated)))
+                         (contains? (:versions recreated) "5"))
+     :update-drop   (and (some? update-drop)
+                         (nil? (:exit update-drop))
+                         (= [] (:errors update-drop))
+                         (= (update-drop-statements table) (command-statements version-table (:executed update-drop)))
+                         (= #{"id" "a"} (:columns (:after update-drop)))
+                         (contains? (:versions update-drop) "6"))}))
+
 (defn- passed?
-  [{:keys [table redefined? error after] :as result}]
-  (and (nil? error)
-       (= (expected-before table) (before-summary result))
-       (= (expected-after table redefined?) after)))
+  [result]
+  (and (nil? (:error result))
+       (every? true? (vals (checks result)))))
 
 (defn- run-drop-columns!
-  "Creates the table with its four dependents in the scratch database, has tern
-  drop the two columns, executes its statements in order, and reads the catalog.
-  With `redefined?`, between tern generating its statements and their execution
-  it re-creates _a2_idx on (id) alone and _a_idx on (b), as a migration could:
-  the run-time condition of tern's statements must leave _a2_idx, which holds no
-  dropped column, and drop _a_idx, which holds b.
+  "Builds the table, its three indexes, the version table and the three tables of
+  migrations 4, 5 and 6 in the scratch database, runs the six migrations, reading
+  the catalog and the version table after each, and drops the five tables when
+  every check passed.
   Never throws: a failure is returned under :error, scrubbed, naming the step."
-  [db redefined?]
+  [db]
   (let [table  (str "tern_dc_" (.format (DateTimeFormatter/ofPattern "yyyyMMddHHmmss")
-                                        (ZonedDateTime/now ZoneOffset/UTC))
-                    (when redefined? "_r"))
+                                        (ZonedDateTime/now ZoneOffset/UTC)))
+        vt     (str table "_versions")
+        ix     (index-names table)
+        t      (keyword table)
+        drop-a (fn [index] {:drop-index (keyword index) :on t})
+        drop-c {:alter-table t :drop-columns [:a :b]}
+        {:keys [ci ci-ix rc ud]} (more-tables table)
         step   (atom "connecting")
-        result (atom {:table table :redefined? redefined? :statements 0})]
+        result (atom {:table table :version-table vt})]
     (try
       (jdbc/with-db-connection [conn (db-spec db)]
         (reset! step "checking the connected database")
@@ -164,104 +326,159 @@
         (jdbc/execute! conn [(format "CREATE TABLE %s (id INT NOT NULL, a VARCHAR(10) NULL, b INT NULL DEFAULT 0)" table)]
                        :transaction? false)
         (swap! result assoc :created true)
-        (doseq [sql [(format "CREATE INDEX %s_a_idx ON %s (a)" table table)
-                     (format "CREATE INDEX %s_a2_idx ON %s (a, id)" table table)
-                     (format "CREATE INDEX %s_id_b_idx ON %s (id, b)" table table)]]
+        (doseq [sql [(format "CREATE INDEX %s ON %s (a)" (:a ix) table)
+                     (format "CREATE INDEX %s ON %s (a, id)" (:a-id ix) table)
+                     (format "CREATE INDEX %s ON %s (id)" (:id ix) table)]]
           (jdbc/execute! conn [sql] :transaction? false))
+        (reset! step "creating the version table")
+        (#'sqlserver/create-version-table db vt)
+        (reset! step "creating the tables of migrations 4, 5 and 6")
+        (doseq [more [ci rc ud]]
+          (jdbc/execute! conn [(format "CREATE TABLE %s (id INT NOT NULL, a INT NULL)" more)] :transaction? false))
         (reset! step "reading the catalog before")
         (swap! result assoc :before (dependents conn table))
-        (reset! step "generating the statements")
-        (let [statements (vec (binding [sqlserver/*db*   db
-                                        sqlserver/*plan* (atom [])]
-                                (doall (sqlserver/generate-sql {:alter-table (keyword table)
-                                                                :drop-columns [:a :b]}))))]
-          (swap! result assoc :statements (count statements))
-          (when redefined?
-            (reset! step "re-creating _a2_idx on (id) and _a_idx on (b)")
-            (doseq [sql [(format "DROP INDEX %s_a2_idx ON %s" table table)
-                         (format "CREATE INDEX %s_a2_idx ON %s (id)" table table)
-                         (format "DROP INDEX %s_a_idx ON %s" table table)
-                         (format "CREATE INDEX %s_a_idx ON %s (b)" table table)]]
-              (println (str label "before tern's statements: " sql))
-              (jdbc/execute! conn [sql] :transaction? false)))
-          ;; tern's statements go through tern's own executor, Statement.execute on the
-          ;; connection, as run-migration! sends them.
-          (doseq [[i sql] (map-indexed vector statements)]
-            (println (str label "statement " (inc i) " of " (count statements) ": " sql))
-            (reset! step (str "statement " (inc i) " of " (count statements)))
-            (#'sqlserver/execute-statement! (jdbc/db-connection conn) sql)))
-        (reset! step "reading the catalog after")
-        (swap! result assoc :after (cond-> (dependents conn table)
-                                     redefined? (assoc :a2-columns (index-columns conn table (str table "_a2_idx")))))
-        (when (and (passed? @result) (= "true" (System/getenv "TERN_SCRATCH_DROP_TABLE")))
-          (reset! step "dropping the table")
-          (jdbc/execute! conn [(format "DROP TABLE %s" table)] :transaction? false)
-          (swap! result assoc :dropped true)))
+        (doseq [[k version on commands]
+                [[:refused       "1" table [drop-c]]
+                 [:first-command "2" table [(drop-a (:a ix)) drop-c]]
+                 [:applied       "3" table [(drop-a (:a ix)) (drop-a (:a-id ix)) drop-c]]
+                 [:created-index "4" ci    [{:create-index (keyword ci-ix) :on (keyword ci) :columns [:a]}
+                                            {:drop-index (keyword ci-ix) :on (keyword ci)}]]
+                 [:recreated     "5" rc    [{:drop-table (keyword rc)}
+                                            {:create-table (keyword rc) :columns [[:id "INT" "NOT NULL"]]}
+                                            {:alter-table (keyword rc) :add-columns [[:a "INT" "NULL"]]}]]
+                 [:update-drop   "6" ud    [{:update (format "ALTER TABLE %s DROP COLUMN a" ud)}
+                                            {:alter-table (keyword ud) :add-columns [[:a "INT" "NULL"]]}]]]]
+          (reset! step (str "running migration " version))
+          (let [run (migrate! db vt version commands)]
+            (reset! step (str "reading the catalog after migration " version))
+            (swap! result assoc k (assoc run
+                                         :after    (dependents conn on)
+                                         :versions (versions conn vt)))))
+        (when (passed? @result)
+          (reset! step "dropping the tables")
+          (doseq [created [table vt ci rc ud]]
+            (jdbc/execute! conn [(format "DROP TABLE %s" created)] :transaction? false))
+          (swap! result assoc
+                 :dropped true
+                 :left    (names conn "SELECT name AS n FROM sys.tables WHERE name IN (?, ?, ?, ?, ?)" table vt ci rc ud))))
       (catch Exception e
         (swap! result assoc :error (scrub db (str "at " @step ": " (.getMessage e))))))
     @result))
 
-(defn- result-line
-  [{:keys [table redefined? statements created dropped error before after] :as result}]
-  (str (if redefined? "DROP-COLUMNS-LIVE-REDEFINED" "DROP-COLUMNS-LIVE")
-       " table=" table " statements=" statements " "
-       (if (passed? result)
-         (if redefined?
-           "columns-gone redefined-index-kept other-indexes-gone default-gone"
-           "columns-gone indexes-gone default-gone")
-         (s/join " " (remove nil?
-                             ["FAILED"
-                              (when (and before (not= (expected-before table) (before-summary result)))
-                                (str "dependents-before=" (pr-str before)))
-                              (when (and after (not= (expected-after table redefined?) after))
-                                (str "after=" (pr-str after)))
-                              (when error (str "error=" (pr-str error)))])))
-       " "
-       (cond dropped     "table-dropped"
-             created     "table-kept"
-             :else       "table-not-created")))
+(defn- after-state
+  "present or absent: whether `name` is among the `k` (:indexes or :columns) a
+  migration's run found afterwards; unknown when it found nothing."
+  [run k name]
+  (cond (nil? (:after run))                  "unknown"
+        (contains? (k (:after run)) name)    "present"
+        :else                                "absent"))
+
+(defn- result-lines
+  [{:keys [table version-table applied created-index recreated update-drop created dropped] :as result}]
+  (let [c    (checks result)
+        ix   (index-names table)
+        more (more-tables table)]
+    [(str "DROP-COLUMNS-REFUSED table=" table " "
+          (if (:refused c) (str "exit=1 indexes=" (:a ix) "," (:a-id ix)) "FAILED"))
+     (str "DROP-COLUMNS-UNCHANGED table=" table " "
+          (if (:unchanged c) "statements-run=0 version-rows=0" "FAILED"))
+     (if (:first-command c)
+       (str "DROP-COLUMNS-FIRST-COMMAND not-applied version-row absent table=" table " refused-index=" (:a-id ix))
+       (str "DROP-COLUMNS-FIRST-COMMAND FAILED table=" table))
+     (str "DROP-COLUMNS-APPLIED table=" table " "
+          (if (:applied c)
+            (str "statements=" (count (command-statements version-table (:executed applied)))
+                 " columns-gone default-gone indexes-gone other-index-kept no-if-exists version-row written")
+            "FAILED"))
+     (str "DROP-INDEX-CREATED table=" (:ci more) " index=" (:ci-ix more)
+          " after=" (after-state created-index :indexes (:ci-ix more)) " "
+          (if (:created-index c) "statements=2 version-row written" "FAILED"))
+     (str "ADD-COLUMNS-AFTER-DROP-TABLE table=" (:rc more) " column=a"
+          " after=" (after-state recreated :columns "a") " "
+          (if (:recreated c) "statements=3 version-row written" "FAILED"))
+     (str "ADD-COLUMNS-AFTER-UPDATE-DROP table=" (:ud more) " column=a"
+          " after=" (after-state update-drop :columns "a") " "
+          (if (:update-drop c) "statements=2 version-row written" "FAILED")
+          " "
+          (cond dropped "tables-dropped"
+                created "tables-kept"
+                :else   "table-not-created"))]))
 
 (let [{:keys [db skip]} (live-scratch)]
   (if db
-    (let [result    (run-drop-columns! db false)
-          redefined (run-drop-columns! db true)]
+    (let [result (run-drop-columns! db)
+          {:keys [table before refused first-command applied created-index recreated update-drop]} result
+          ix     (index-names table)]
       (println (str label "ran against " (:host db) "/" (:database db)
-                    " table " (:table result) " and " (:table redefined)))
-      (println (result-line result))
-      (println (result-line redefined))
+                    " table " table " and " (:version-table result)))
+      (doseq [line (result-lines result)]
+        (println line))
+      (when-not (passed? result)
+        (println (str label "what it found: " (pr-str (dissoc result :table :version-table)))))
 
-      ;; The table had what makes a column drop fail on SQL Server: three indexes (two of
-      ;; them on a) and a default.
-      (expect (expected-before (:table result))
-              (before-summary result))
-
-      ;; tern's statements ran without error, in order (a dependent left behind is error 5074).
+      ;; Every step ran, and the table had what it was built with: a in two indexes, a third
+      ;; index on id, a default on b.
       (expect nil
               (:error result))
 
-      ;; a and b, the three indexes and the default are gone; the table and id are not.
-      (expect #{"id"}
-              (:columns (:after result)))
+      (expect (expected-before table)
+              (before-summary result))
 
-      (expect #{}
-              (:indexes (:after result)))
+      ;; 1. The column drop alone is refused for each of a's indexes, by name ...
+      (expect {:exit 1 :errors #{(refusal table "a" (:a ix)) (refusal table "a" (:a-id ix))} :count 2}
+              {:exit (:exit refused) :errors (set (:errors refused)) :count (count (:errors refused))})
 
-      (expect #{}
-              (:defaults (:after result)))
+      ;; ... before anything ran: nothing executed, the catalog as it was, no version row.
+      (expect {:executed [] :after before :versions #{}}
+              (select-keys refused [:executed :after :versions]))
 
-      (expect #{(:table result)}
-              (:tables (:after result)))
+      ;; 2. With one of the two index drops first, the drop is refused for the other, and the
+      ;; first command never reached the database: its index is still there, no version row.
+      (expect {:exit 1 :errors [(refusal table "a" (:a-id ix))] :executed [] :after before :versions #{}}
+              (select-keys first-command [:exit :errors :executed :after :versions]))
 
-      ;; The redefined scenario: the same dependents before, no error, and afterwards a and
-      ;; b, _id_b_idx, the default and _a_idx (re-created on b, a dropped column) gone while
-      ;; _a2_idx, re-created on (id) between generation and execution, survives with that
-      ;; definition.
-      (expect (expected-before (:table redefined))
-              (before-summary redefined))
+      ;; 3. With both index drops first, the migration runs whole: the two DROP INDEX
+      ;; statements, then the default and both columns in one statement, nothing else; a, b,
+      ;; the default and the two indexes gone, id and its index kept, the version recorded.
+      (expect {:exit     nil
+               :errors   []
+               :executed (applied-statements table (first (:defaults before)))
+               :after    (expected-after-applied table)
+               :versions #{"3"}}
+              (-> (select-keys applied [:exit :errors :executed :after :versions])
+                  (update :executed #(command-statements (:version-table result) %))))
 
-      (expect nil
-              (:error redefined))
+      ;; 4. An index created and then dropped in one migration: the drop-index guard reads the
+      ;; create and emits DROP INDEX IF EXISTS, so both statements run and the index is gone; the
+      ;; version recorded.
+      (expect {:exit nil :errors [] :executed (created-index-statements table) :indexes #{} :version-row true}
+              {:exit        (:exit created-index)
+               :errors      (:errors created-index)
+               :executed    (command-statements (:version-table result) (:executed created-index))
+               :indexes     (:indexes (:after created-index))
+               :version-row (contains? (:versions created-index) "4")})
 
-      (expect (expected-after (:table redefined) true)
-              (:after redefined)))
+      ;; 5. A table dropped and created again without a, then a added: the add-columns guard reads
+      ;; the drop, though the catalog read before the migration shows a, so the three statements
+      ;; run and a is there; the version recorded.
+      (expect {:exit nil :errors [] :executed (recreated-statements table) :columns #{"id" "a"} :version-row true}
+              {:exit        (:exit recreated)
+               :errors      (:errors recreated)
+               :executed    (command-statements (:version-table result) (:executed recreated))
+               :columns     (:columns (:after recreated))
+               :version-row (contains? (:versions recreated) "5")})
+
+      ;; 6. A column dropped by a plain :update and added again by an :alter-table: the add-columns
+      ;; guard reads the :update's drop, though the catalog read before the migration shows a, so
+      ;; both statements run and a is there; the version recorded.
+      (expect {:exit nil :errors [] :executed (update-drop-statements table) :columns #{"id" "a"} :version-row true}
+              {:exit        (:exit update-drop)
+               :errors      (:errors update-drop)
+               :executed    (command-statements (:version-table result) (:executed update-drop))
+               :columns     (:columns (:after update-drop))
+               :version-row (contains? (:versions update-drop) "6")})
+
+      ;; Every check passed, so the five tables were dropped and the scratch database keeps none.
+      (expect {:dropped true :left #{}}
+              (select-keys result [:dropped :left])))
     (println (str label "skipped (" skip ")"))))

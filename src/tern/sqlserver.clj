@@ -7,7 +7,7 @@
            [java.sql Connection PreparedStatement Statement Timestamp]))
 
 (declare primary-key-exists? get-primary-key foreign-key-exists? index-exists? column-exists? table-exists? get-column-constraints
-         get-column-indexes get-column-defaults catalog-name plan-dropped-tables)
+         get-column-indexes get-column-defaults folded-name plan-dropped-tables as-claimed)
 
 (def ^:dynamic *db* nil)
 (def ^:dynamic *plan* nil)
@@ -56,8 +56,17 @@
                   :when (not (get ignore-options (:name option)))]
               (format "%s=%s" (:name option) (:value option))))))
 
+(defn- command-key
+  "The command key `command` is generated and run by: the first of its keys, in
+  the command's own key order, that names a supported command
+  (supported-commands).  A command holding two command keys runs the first
+  alone; a migration file read as EDN keeps the order its keys are written in
+  for a map of up to eight keys."
+  [command]
+  (some supported-commands (keys command)))
+
 (defmulti generate-sql
-  (fn [c] (some supported-commands (keys c))))
+  command-key)
 
 (def column-spec-map
   {"auto_increment" "identity"
@@ -125,7 +134,7 @@
         pk (generate-pk command)]
     (if (and *db*
              (table-exists? *db* (to-sql-name table :quote-for-statement false))
-             (not (contains? (plan-dropped-tables @*plan*) (catalog-name table))))
+             (not (contains? (plan-dropped-tables as-claimed @*plan*) (folded-name table))))
       (do (log/info (format "  * Skipping CREATE TABLE %s because it already exists." (to-sql-name table)))
           nil)
       (if (not-empty table-spec)
@@ -157,69 +166,564 @@
   [k]
   (to-sql-name k :quote-for-statement false))
 
+(defn- folded-name
+  "A name as the plan and the catalog are compared: its catalog name in lower
+  case, in the root locale so that no default locale folds it otherwise (a
+  Turkish one would fold I to a dotless i).  SQL Server's default collation does
+  not tell identifiers apart by case, and neither do the OBJECT_ID and
+  indexproperty the guards ask, so :IX_A and ix_a name one index."
+  [k]
+  (.toLowerCase ^String (catalog-name k) java.util.Locale/ROOT))
+
+(def ^:private drop-index-clause
+  "A T-SQL `DROP INDEX [IF EXISTS] <index> ON <table>[, <index> ON <table> ...]`,
+  or the legacy `DROP INDEX <table>.<index>[, ...]`: keywords in any case, any
+  whitespace, each name bare (ending at a quote too, so that a statement in a
+  string literal reads), [bracketed] or \"double-quoted\", a table possibly
+  qualified (only its last segment counts).  Group 1 is the list of drops
+  (drop-index-item finds each).  The drop clauses are matched as a whole
+  statement for the refusal (whole-statement) and anywhere in a statement for
+  the guards (anywhere)."
+  #"(?i)\bDROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?((?:(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)|(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s*\.\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+))(?:\s*,\s*(?:(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)|(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s*\.\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)))*)")
+
+(def ^:private drop-index-item
+  "One drop of a list drop-index-clause has matched: groups 1 and 2 are the index
+  and the table of an `<index> ON <table>`, groups 3 and 4 the table and the index
+  of a legacy `<table>.<index>`."
+  #"(?i)(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)|(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)\s*\.\s*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,]+)")
+
+(def ^:private drop-table-clause
+  "A T-SQL `DROP TABLE [IF EXISTS] <table>[, <table> ...]`, read as
+  drop-index-clause reads its names (a bare name also ends at a parenthesis).
+  Group 1 is the list of tables (qualified-name finds each)."
+  #"(?i)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?((?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s*,\s*(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+))*)")
+
+(def ^:private qualified-name
+  "One possibly qualified name of a list; group 1 is its last segment."
+  #"(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)")
+
+(def ^:private alter-table-drop-clause
+  "A T-SQL `ALTER TABLE <table> DROP <item>[, <item> ...]` with its whole list, as
+  T-SQL mixes constraints, columns and a period in one drop: an item is
+  `[CONSTRAINT | COLUMN] [IF EXISTS] <name> [WITH (<options>)]` or `PERIOD FOR
+  SYSTEM_TIME`, names read as drop-table-clause reads them (a WITH's options may
+  hold one level of parentheses, as MOVE TO <scheme>(<column>) does).  Group 1 is
+  the table, group 2 the list (drop-list-items reads its items in order)."
+  #"(?i)\bALTER\s+TABLE\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)\s+DROP\s+((?:PERIOD\s+FOR\s+SYSTEM_TIME\b|(?:(?:CONSTRAINT|COLUMN)\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|COLUMN)\b)(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s*WITH\s*\((?:[^()]|\([^()]*\))*\))?)(?:\s*,\s*(?:PERIOD\s+FOR\s+SYSTEM_TIME\b|(?:(?:CONSTRAINT|COLUMN)\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|COLUMN)\b)(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s*WITH\s*\((?:[^()]|\([^()]*\))*\))?))*)")
+
+(def ^:private drop-list-token
+  "One token of a list alter-table-drop-clause has matched: CONSTRAINT or COLUMN
+  (group 1), PERIOD FOR SYSTEM_TIME (group 2), IF EXISTS or WITH (<options>) (no
+  group), or a name (group 3)."
+  #"(?i)\b(CONSTRAINT|COLUMN)\b|\b(PERIOD\s+FOR\s+SYSTEM_TIME)\b|\bIF\s+EXISTS\b|\bWITH\s*\((?:[^()]|\([^()]*\))*\)|(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)")
+
+(def ^:private create-index-clause
+  "A T-SQL `CREATE [UNIQUE] [CLUSTERED|NONCLUSTERED] [COLUMNSTORE] INDEX <index>
+  ON <table> (<columns>) [INCLUDE (<columns>)]` anywhere in a statement (re-seq):
+  behind an IF, before a WHERE, WITH or ON <filegroup>, or in a comment or a
+  string, since a create counted too often only refuses a column drop.  Names
+  are read as drop-table-clause reads them; a key column may be followed by
+  ASC or DESC.  Group 1 is the index, group 2 the table, group 3 the key columns
+  (index-key-column finds each), group 4 the included columns, if any
+  (sql-identifier finds each)."
+  #"(?i)\bCREATE\s+(?:UNIQUE\s+)?(?:(?:CLUSTERED|NONCLUSTERED)\s+)?(?:COLUMNSTORE\s+)?INDEX\s+(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)\s+ON\s+(?:(?:\[[^\]]*\]|\"[^\"]*\"|[^\s\[\]\"'.;,()]*)\s*\.\s*)*(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)\s*\(\s*((?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s+(?:ASC|DESC))?(?:\s*,\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s+(?:ASC|DESC))?)*)\s*\)(?:\s*INCLUDE\s*\(\s*((?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s*,\s*(?:\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+))*)\s*\))?")
+
+(def ^:private sql-identifier
+  "One name of a list a clause pattern above has matched."
+  #"\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+")
+
+(def ^:private index-key-column
+  "One key column of a list create-index-clause has matched, with its ASC or
+  DESC.  Group 1 is the name."
+  #"(?i)(\[[^\]]+\]|\"[^\"]+\"|[^\s\[\]\"'.;,()]+)(?:\s+(?:ASC|DESC))?")
+
+(defn- unquoted-identifier
+  "`s` without the [brackets] or \"double quotes\" that delimit it, if any."
+  [s]
+  (if (or (and (s/starts-with? s "[") (s/ends-with? s "]"))
+          (and (s/starts-with? s "\"") (s/ends-with? s "\"")))
+    (subs s 1 (dec (count s)))
+    s))
+
+(defn- blank-comments
+  "`statement` with each comment replaced by one space, as SQL Server reads
+  comments: `-- ...` to the end of its line, and `/* ... */`, which nests (a `/*`
+  inside one opens another that needs its own `*/`; an unclosed one runs to the
+  end).  String literals and delimited names are not parsed, so a `--` or `/*`
+  inside one is blanked like any other; whole-statement and anywhere also match
+  the text as written, so that can only cost a match the blanked text alone
+  would have given, never one the text as written gives."
+  [^String statement]
+  (let [n   (.length statement)
+        out (StringBuilder.)]
+    (loop [i 0]
+      (cond
+        (>= i n)
+        (str out)
+
+        (.startsWith statement "--" i)
+        (do (.append out \space)
+            (recur (loop [j i]
+                     (if (or (>= j n) (#{\newline \return} (.charAt statement j))) j (recur (inc j))))))
+
+        (.startsWith statement "/*" i)
+        (do (.append out \space)
+            (recur (loop [j (+ i 2) depth 1]
+                     (cond (zero? depth)                  j
+                           (>= j n)                       n
+                           (.startsWith statement "/*" j) (recur (+ j 2) (inc depth))
+                           (.startsWith statement "*/" j) (recur (+ j 2) (dec depth))
+                           :else                          (recur (inc j) depth)))))
+
+        :else
+        (do (.append out (.charAt statement i))
+            (recur (inc i)))))))
+
+(def ^:private whole-statement-pattern
+  "`clause` as one whole statement: the clause alone, with any whitespace around
+  it and an optional closing semicolon."
+  (memoize (fn [clause] (re-pattern (str "\\s*(?:" clause ")\\s*;?\\s*")))))
+
+(defn- whole-statement
+  "The matches of `clause` when `statement`, as written or with its comments
+  blanked (blank-comments), is that clause alone, as a seq of at most two
+  matches: a clause behind a condition or after other text is not read, a
+  comment inside, before or after it does not hide it, and a clause written only
+  inside a comment is not read.  Both texts are matched and their matches joined
+  (distinct), as anywhere joins them, so a `--` or `/*` inside a delimited name
+  ([ix--a]) is read from the text as written and a name glued to a comment
+  marker (t--gone) from the blanked text.  Both readings move this one towards
+  crediting a drop more often, but only a drop that runs: the column-drop
+  refusal reads the plan this way (as-run), and a drop it credits must run, or
+  the column drop it lets through fails (error 5074), while a drop it misses
+  only refuses a migration that would have run."
+  [clause statement]
+  (let [pattern (whole-statement-pattern clause)]
+    (distinct (remove nil? [(re-matches pattern statement) (re-matches pattern (blank-comments statement))]))))
+
+(defn- anywhere
+  "Every match of `clause` anywhere in `statement`, behind a condition included,
+  in the text as written and in the text with its comments blanked
+  (blank-comments), the matches joined: a clause written inside a comment still
+  counts, and a comment inside a clause no longer hides it.  Reading both moves
+  the credit only upwards: the guards read drops this way (as-claimed), where a
+  drop counted too often makes a create or an add fail when it runs, while one
+  missed would skip it and lose the object without a word; and the create reader
+  (clause-created-indexes) reads creates this way, where a create counted too
+  often refuses a column drop or emits a DROP INDEX IF EXISTS that does nothing,
+  while one missed would let a column drop meet error 5074."
+  [clause statement]
+  (concat (re-seq clause statement) (re-seq clause (blank-comments statement))))
+
+(defn- statement-strings
+  "The statements of a `:sqlserver` override or an `:update`: each string in
+  `sql`, a string or a vector of strings at any depth, as run-migration! runs
+  them (tern.db/sql-statements)."
+  [sql]
+  (filter string? (tree-seq sequential? seq sql)))
+
+(def ^:private identifier-token
+  "One identifier as a statement may spell it, anywhere, a string literal
+  included: [bracketed] (group 1), \"double-quoted\" (group 2), or a bare run of
+  letters, digits, _, @, # and $ (group 3)."
+  #"\[([^\]]+)\]|\"([^\"]+)\"|([\p{L}\p{N}_@#$]+)")
+
+(defn- named-in
+  "The folded names (folded-name) the identifier tokens in the statements of
+  `sql` spell."
+  [sql]
+  (set (for [statement (statement-strings sql)
+             [_ bracketed quoted bare] (re-seq identifier-token statement)]
+         (folded-name (or bracketed quoted bare)))))
+
+(defn- claimed-object
+  "The object a plan reader's claim names: the index or constraint of a [table
+  name] pair, or the table itself."
+  [claim]
+  (if (vector? claim) (peek claim) claim))
+
+(defn- statement-carrier
+  "The statements `command` runs on SQL Server in place of its own keys, or nil:
+  its `:sqlserver` override when it has one, which run-migration! runs instead of
+  what generate-sql gives for the command, and otherwise its `:update` when its
+  command key (command-key) is `:update`, a plain `:update`: generate-sql then
+  dispatches to the `:update` method, whose one result is the `:update` itself,
+  a string or a vector of strings that run-migration! flattens and runs one
+  statement per string.  A command whose command key is another one runs that
+  key's statements and is read by its keys, while an `:update` it also holds
+  never runs and is not read; a command with an override runs the override
+  alone, and its `:update` is not read either.  The one place the plan readers
+  choose what a command is read by (as-run, as-claimed)."
+  [command]
+  (or (:sqlserver command) (when (= :update (command-key command)) (:update command))))
+
+(defn- as-run
+  "What `read-override` finds in the statements `command` runs in place of its
+  keys (statement-carrier: its `:sqlserver` override, or else a plain
+  `:update`), matching each clause as a whole statement (whole-statement), and
+  otherwise what `read-command` finds in the command: run-migration! runs an
+  override in place of the command's own keys, so those keys do nothing on SQL
+  Server and are not read.  The column-drop refusal reads the plan this way: a
+  drop not read in an override or an `:update` leaves the refusal, the safe side."
+  [command read-override read-command]
+  (if-let [carrier (statement-carrier command)]
+    (read-override whole-statement carrier)
+    (read-command command)))
+
+(defn- as-claimed
+  "What `read-override` finds in the statements `command` runs in place of its
+  keys (statement-carrier: its `:sqlserver` override, or else a plain
+  `:update`), matching each clause anywhere in a statement (anywhere), together
+  with those claims of the command's own keys (`read-command`) whose object
+  those statements name somewhere in their text (named-in); without either,
+  what the keys claim.  A plain `:update` with no other command key has no keys
+  that claim a drop, so it counts by its statements alone; one held beside
+  another command key also counts that key's claims whose object its
+  statements name, as a command with an override does.  The guards read the
+  plan this way: a guard that missed a drop would skip a create or an add the
+  catalog still shows, losing the object without a word, while one that counts
+  a drop too many emits a create or an add that fails when it runs.  A key
+  whose object those statements never mention is an instruction for another
+  database, or one that never runs beside a plain `:update`, and SQL Server
+  keeps the object."
+  [command read-override read-command]
+  (if-let [carrier (statement-carrier command)]
+    (let [named (named-in carrier)]
+      (concat (read-override anywhere carrier)
+              (filter #(contains? named (claimed-object %)) (read-command command))))
+    (read-command command)))
+
+(defn- override-dropped-indexes
+  "The [table index] pairs, folded (folded-name), that the DROP INDEX clauses in
+  the statements of a `:sqlserver` override or a plain `:update`
+  (statement-carrier) drop, each clause found by `match` (whole-statement or
+  anywhere), every drop of its list.  A DROP INDEX naming no table drops nothing
+  here."
+  [match override]
+  (for [statement (statement-strings override)
+        [_ drops] (match drop-index-clause statement)
+        [_ index table legacy-table legacy-index] (re-seq drop-index-item drops)]
+    [(folded-name (unquoted-identifier (or table legacy-table)))
+     (folded-name (unquoted-identifier (or index legacy-index)))]))
+
 (defn- plan-dropped-indexes
-  "The [table index] pairs, as catalog names, that the commands in `plan` drop:
-  a `{:drop-index i :on t}` command, or the `:drop-index` key of an `:alter-table`.
-  A `:drop-index` command without `:on` names no table and is left out."
-  [plan]
+  "The [table index] pairs, folded (folded-name), that the commands in `plan`
+  drop: a `{:drop-index i :on t}` command, or the `:drop-index` key of an
+  `:alter-table` (one index, or a collection of them), and for a command with a
+  `:sqlserver` override, or a plain `:update` without one, the DROP INDEX
+  statements those hold, read by `reading` (as-run or as-claimed).  A
+  `:drop-index` command without `:on` names no table and is left out.  Reading
+  a plain `:update` as an override is read moves the credit only upwards, and
+  only by drops its statements make, for each consumer on its safe side: the
+  create-index guard reads as-claimed, where an index counted as dropped too
+  often makes its CREATE fail when it runs, while one missed would skip the
+  create and lose the index without a word; the column-drop refusal and the
+  drop-index guard read as-run (plan-created-indexes), crediting only a
+  statement that is the drop alone, which has run when the commands after it
+  run, so the column drop meets no error 5074 and the DROP INDEX skipped had
+  nothing left to drop, while a drop they miss only refuses a column drop or
+  leaves a DROP INDEX IF EXISTS that does nothing."
+  [reading plan]
   (set (mapcat (fn [command]
-                 (let [index (:drop-index command)]
-                   (cond (nil? index) nil
-                         (:alter-table command) (for [i (if (coll? index) index [index])]
-                                                  [(catalog-name (:alter-table command)) (catalog-name i)])
-                         (:on command) [[(catalog-name (:on command)) (catalog-name index)]])))
+                 (reading command
+                          override-dropped-indexes
+                          (fn [{index :drop-index table :alter-table on :on}]
+                            (cond (nil? index) nil
+                                  table        (for [i (if (coll? index) index [index])]
+                                                 [(folded-name table) (folded-name i)])
+                                  on           [[(folded-name on) (folded-name index)]]))))
                plan)))
 
+(defn- drop-list-items
+  "The items of a list alter-table-drop-clause has matched, in order, each
+  [:constraint name] or [:column name], the name without its brackets or quotes:
+  a name at the start of the list or after CONSTRAINT is a constraint, every name
+  after COLUMN, up to the next keyword, a column; PERIOD FOR SYSTEM_TIME is
+  neither, and a name after it starts another item, a constraint, as T-SQL reads
+  it; IF EXISTS and a WITH (...) are passed over."
+  [items]
+  (first (reduce (fn [[found kind] [_ keyword period name]]
+                   (cond keyword [found (if (.equalsIgnoreCase "COLUMN" ^String keyword) :column :constraint)]
+                         period  [found :constraint]
+                         name    [(conj found [kind (unquoted-identifier name)]) kind]
+                         :else   [found kind]))
+                 [[] :constraint]
+                 (re-seq drop-list-token items))))
+
+(defn- override-dropped-items
+  "The [table name] pairs, folded (folded-name), of the items of kind `kind`
+  (drop-list-items) that the ALTER TABLE ... DROP clauses in the statements of a
+  `:sqlserver` override or a plain `:update` drop, each clause found by `match`
+  (whole-statement or anywhere)."
+  [kind match override]
+  (for [statement (statement-strings override)
+        [_ table items] (match alter-table-drop-clause statement)
+        [item-kind item] (drop-list-items items)
+        :when (= item-kind kind)]
+    [(folded-name (unquoted-identifier table)) (folded-name item)]))
+
+(defn- override-dropped-constraints
+  "The [table constraint] pairs, folded (folded-name), that the ALTER TABLE ...
+  DROP clauses in the statements of a `:sqlserver` override or a plain `:update`
+  drop, each clause found by `match` (whole-statement or anywhere), every
+  constraint of its whole list: one after a COLUMN item or after a WITH (...)
+  counts too.  Reading the whole list moves the credit only upwards, and only by
+  drops the statement makes: the add-constraints guard reads it as-claimed,
+  where a constraint counted as dropped too often makes its ADD fail when it
+  runs, while one missed would skip the add and lose the constraint without a
+  word."
+  [match override]
+  (override-dropped-items :constraint match override))
+
+(defn- override-dropped-columns
+  "The [table column] pairs, folded (folded-name), that the ALTER TABLE ... DROP
+  clauses in the statements of a `:sqlserver` override or a plain `:update`
+  drop, each clause found by `match` (whole-statement or anywhere): the COLUMN
+  items of the whole list.  The add-columns guard reads it as-claimed, where a
+  column counted as dropped too often makes its ADD fail when it runs (the
+  column is still there), while one missed would skip the add and lose the
+  column without a word."
+  [match override]
+  (override-dropped-items :column match override))
+
 (defn- plan-dropped-constraints
-  "The [table constraint] pairs, as catalog names, that the `:drop-constraints`
-  keys of the `:alter-table` commands in `plan` drop."
-  [plan]
-  (set (for [command plan
-             :let [table       (:alter-table command)
-                   constraints (:drop-constraints command)]
-             :when (and table constraints)
-             constraint (if (coll? constraints) constraints [constraints])]
-         [(catalog-name table) (catalog-name constraint)])))
+  "The [table constraint] pairs, folded (folded-name), that the commands in
+  `plan` drop: the `:drop-constraints` key of an `:alter-table` (a collection of
+  constraints, or one), and for a command with a `:sqlserver` override, or a
+  plain `:update` without one, the constraint items of the ALTER TABLE ... DROP
+  statements those hold (override-dropped-constraints, the whole list), read by
+  `reading` (as-run or as-claimed).  Reading a plain `:update` as an override is
+  read moves the credit only upwards, and only by drops its statements make: the
+  one consumer, the add-constraints guard, reads as-claimed, where a constraint
+  counted as dropped too often makes its ADD fail when it runs, while one missed
+  would skip the add and lose the constraint without a word."
+  [reading plan]
+  (set (mapcat (fn [command]
+                 (reading command
+                          override-dropped-constraints
+                          (fn [{table :alter-table constraints :drop-constraints}]
+                            (when (and table constraints)
+                              (for [constraint (if (coll? constraints) constraints [constraints])]
+                                [(folded-name table) (folded-name constraint)])))))
+               plan)))
+
+(defn- plan-dropped-columns
+  "The [table column] pairs, folded (folded-name), that the commands in `plan`
+  drop: the `:drop-columns` key of an `:alter-table` (a collection of columns, or
+  one), and for a command with a `:sqlserver` override, or a plain `:update`
+  without one, the COLUMN items of the ALTER TABLE ... DROP statements those hold
+  (override-dropped-columns), read by `reading` (as-run or as-claimed).  Its one
+  consumer, the add-columns guard (plan-drops-column?), reads it as-claimed,
+  crediting a drop more often rather than less, and reading a plain `:update` as
+  an override is read moves that credit further upwards, only by drops its
+  statements make: a column counted as dropped too often makes its ADD fail when
+  it runs, while one missed would skip the add and lose the column without a
+  word, as a column an `:update` dropped and an `:alter-table` added again was
+  lost before."
+  [reading plan]
+  (set (mapcat (fn [command]
+                 (reading command
+                          override-dropped-columns
+                          (fn [{table :alter-table columns :drop-columns}]
+                            (when (and table columns)
+                              (for [column (if (coll? columns) columns [columns])]
+                                [(folded-name table) (folded-name column)])))))
+               plan)))
+
+(defn- override-dropped-tables
+  "The tables, folded (folded-name), that the DROP TABLE clauses in the
+  statements of a `:sqlserver` override or a plain `:update` drop, each clause
+  found by `match` (whole-statement or anywhere), every table of its list."
+  [match override]
+  (for [statement (statement-strings override)
+        [_ tables] (match drop-table-clause statement)
+        [_ table] (re-seq qualified-name tables)]
+    (folded-name (unquoted-identifier table))))
 
 (defn- plan-dropped-tables
-  "The tables, as catalog names, that the `{:drop-table t}` commands in `plan`
-  drop.  Dropping a table drops every index and constraint on it, so a later
-  `:create-index` or `:add-constraints` on a table of this set is emitted even
-  though the catalog, read before anything runs, still shows the old one."
-  [plan]
-  (set (for [command plan
-             :let [table (:drop-table command)]
-             :when table]
-         (catalog-name table))))
+  "The tables, folded (folded-name), that the commands in `plan` drop: a
+  `{:drop-table t}` command, and for a command with a `:sqlserver` override, or a
+  plain `:update` without one, the DROP TABLE statements those hold, read by
+  `reading` (as-run or as-claimed).  Dropping a table drops every index and
+  constraint on it, so a later `:create-index` or `:add-constraints` on a table
+  of this set is emitted even though the catalog, read before anything runs,
+  still shows the old one.  Reading a plain `:update` as an override is read
+  moves the credit only upwards, and only by drops its statements make, for each
+  consumer on its safe side: the create-table, create-index, add-constraints and
+  add-columns guards read as-claimed, where a table counted as dropped too often
+  makes the create or add fail when it runs, while one missed would skip it and
+  lose the table, index, constraint or column without a word; the column-drop
+  refusal and the drop-index guard read as-run, crediting only a statement that
+  is the drop alone, which has run when the commands after it run, while a drop
+  they miss only refuses a column drop or leaves a DROP INDEX IF EXISTS that
+  does nothing."
+  [reading plan]
+  (set (mapcat (fn [command]
+                 (reading command
+                          override-dropped-tables
+                          (fn [{table :drop-table}]
+                            (when table [(folded-name table)]))))
+               plan)))
 
-(defn- sql-literal
-  "`s` as a T-SQL string literal, single quotes doubled."
-  [s]
-  (str "'" (s/replace (str s) "'" "''") "'"))
+(defn- plan-drops-column?
+  "Whether a command in `plan` drops `column` of `table`, or the whole table, as
+  the guards read the plan (as-claimed: plan-dropped-columns and
+  plan-dropped-tables), names compared folded (folded-name).  The add-columns
+  guard asks it, with the command's own :drop-columns at the end of the plan,
+  since tern emits that DROP before the ADD.  It errs towards a drop: one counted
+  too often makes the ADD fail when it runs (the column is still there), while
+  one missed would skip the add the catalog seems to make needless and lose the
+  column without a word."
+  [plan table column]
+  (boolean (or (contains? (plan-dropped-columns as-claimed plan) [(folded-name table) (folded-name column)])
+               (contains? (plan-dropped-tables as-claimed plan) (folded-name table)))))
 
-(defn- bracketed
-  "`s` as a T-SQL bracket-delimited identifier, as QUOTENAME makes one: [s] with
-  each ] doubled (a [ inside needs no escape)."
-  [s]
-  (str "[" (s/replace (str s) "]" "]]") "]"))
+(defn- create-index-skipped?
+  "Whether the guard of a `{:create-index index :on table}` skips it when the
+  commands `earlier` come before it in the migration: tern holds a connection,
+  the catalog, read before the migration runs, shows the index, and no earlier
+  command drops the index or its table (as-claimed)."
+  [earlier table index]
+  (boolean (and *db*
+                (index-exists? *db* (to-sql-name table) (to-sql-name index))
+                (not (or (contains? (plan-dropped-indexes as-claimed earlier) [(folded-name table) (folded-name index)])
+                         (contains? (plan-dropped-tables as-claimed earlier) (folded-name table)))))))
 
-(defn- drop-index-if-it-holds
-  "One statement that drops `index` from `table` only if, when it runs, the index
-  still contains one of `columns`, the columns the command drops: the catalog is
-  read at execution time, so an index the migration has meanwhile dropped, or
-  redefined without those columns (by :create-index, raw SQL or an override), is
-  left alone, and one redefined to hold any of them is dropped.  `index` and
-  `columns` are catalog names; the predicate carries them as literals, the DROP
-  the index bracketed and the table as to-sql-name gives it."
-  [table index columns]
-  (format (str "IF EXISTS (SELECT 1 FROM sys.indexes i"
-               " JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id"
-               " JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id"
-               " JOIN sys.objects o ON o.object_id = i.object_id"
-               " WHERE o.name = %s AND i.name = %s AND c.name IN (%s))"
-               " DROP INDEX %s ON %s")
-          (sql-literal (catalog-name table)) (sql-literal index) (s/join ", " (map sql-literal columns))
-          (bracketed index) (to-sql-name table)))
+(defn- clause-created-indexes
+  "The indexes the CREATE INDEX clauses in `statements` create (create-index-clause),
+  each [table index columns]: the table folded (folded-name), the index as a
+  catalog name, the key and included columns a set of folded names.  The clauses
+  are found anywhere, in the text as written and with its comments blanked, so a
+  create in a comment counts and a comment inside a create does not hide it: a
+  create counted too often refuses a column drop (loud) or emits a DROP INDEX IF
+  EXISTS that does nothing, while one missed would let a column drop meet error
+  5074 or leave the index without a word."
+  [statements]
+  (for [statement statements
+        [_ index table key-columns included] (anywhere create-index-clause statement)]
+    [(folded-name (unquoted-identifier table))
+     (catalog-name (unquoted-identifier index))
+     (set (for [column (concat (map second (re-seq index-key-column key-columns))
+                               (when included (re-seq sql-identifier included)))]
+            (folded-name (unquoted-identifier column))))]))
+
+(defn- created-indexes
+  "The indexes `command` creates (as-run) when the commands `earlier` come before
+  it, each [table index columns] as clause-created-indexes gives them.  A
+  `:sqlserver` override, or a plain `:update` without one (statement-carrier),
+  creates what the CREATE INDEX clauses anywhere in its statements create.  A
+  `{:create-index i :on t :columns [...]}` creates i over its columns, each
+  without the (n) prefix length the generator strips or a trailing ASC or DESC,
+  unless its guard skips it (create-index-skipped?)."
+  [earlier command]
+  (as-run command
+          (fn [_ override] (clause-created-indexes (statement-strings override)))
+          (fn [{index :create-index table :on columns :columns}]
+            (when (and index table (not (create-index-skipped? earlier table index)))
+              [[(folded-name table)
+                (catalog-name index)
+                (set (for [column columns]
+                       (folded-name (s/replace (second (re-matches #"([^()]+)(?:\(\d+\))?" (name column)))
+                                               #"(?i)\s+(?:ASC|DESC)$" ""))))]]))))
+
+(defn- plan-created-indexes
+  "The indexes on `table` (folded) that the commands in `plan` create and no
+  later command in `plan` drops, in plan order, each [index columns] as
+  created-indexes gives them.  A later drop is a DROP INDEX of the index on the
+  table in an override or a plain `:update`, the `:drop-index` key of an
+  `:alter-table` of the table, a `{:drop-index i :on t}` command, or a drop of
+  the whole table, each read as-run.  A `{:drop-index i :on t}` counts by its
+  key: its guard emits a DROP INDEX IF EXISTS for an index an earlier command
+  creates and nothing between drops again (plan-created-index?), so the index
+  is gone after it, whether or not it was there, and counting it credits no
+  drop that does not happen."
+  [plan table]
+  (let [plan (vec plan)]
+    (for [position         (range (count plan))
+          [t index columns] (created-indexes (subvec plan 0 position) (nth plan position))
+          :when (= t table)
+          :let [later (subvec plan (inc position))]
+          :when (not (or (contains? (plan-dropped-indexes as-run later) [t (folded-name index)])
+                         (contains? (plan-dropped-tables as-run later) t)))]
+      [index columns])))
+
+(defn- plan-created-index?
+  "Whether a command in `plan`, the commands before a `{:drop-index index :on
+  table}`, creates the index on the table and no later command in `plan` drops it
+  again or drops the table (plan-created-indexes), names compared folded
+  (folded-name).  The drop-index guard asks it when the catalog, read before the
+  migration runs, does not show the index, and on its yes emits DROP INDEX IF
+  EXISTS.  It errs towards the index being there: it reads creates generously (a
+  create in a comment, a string or behind a condition counts) and a drop between
+  only as a whole statement of an override, a plain :update or a key (as-run),
+  so it can say yes for an index that is not there when the drop runs (a create
+  that did not run, or a drop between in a form not read as one: inside the
+  creating command itself, behind a condition, in a statement that holds more
+  than the drop), and the IF EXISTS makes that drop a no-op rather than error
+  3701.  The side left is silent: a create written in a form not read (dynamic
+  SQL that does not spell the statement, say) is missed, its drop skipped, and
+  the index stays on the table without a word."
+  [plan table index]
+  (boolean (some (fn [[created _]] (= (folded-name created) (folded-name index)))
+                 (plan-created-indexes plan (folded-name table)))))
+
+(defn- distinct-folded
+  "`names` in order, without a name that folds (folded-name) as an earlier one does."
+  [names]
+  (second (reduce (fn [[seen kept] n]
+                    (if (seen (folded-name n))
+                      [seen kept]
+                      [(conj seen (folded-name n)) (conj kept n)]))
+                  [#{} []]
+                  names)))
+
+(defn- exit!
+  "Ends the process with `status`, as tern does when a migration cannot be run.
+  A var, so that a test can trap the exit."
+  [status]
+  (System/exit status))
+
+(defn- refuse-indexed-column-drops!
+  "SQL Server refuses to drop a column that an index contains (error 5074).  When
+  an :alter-table of `table` drops `columns` and an index containing one of them
+  is still there when the command runs, this stops the migration before any of
+  its statements runs: one error line per column and index, then the exit, as
+  tern's other refusals do.  The indexes are those the catalog shows
+  (get-column-indexes, read while the migration's SQL is generated) and, with a
+  connection, those an earlier command of the migration creates
+  (plan-created-indexes).  A catalog index counts as dropped first when an
+  earlier {:drop-index i :on table} command or :alter-table :drop-index key, a
+  DROP INDEX ... ON table statement of an earlier :sqlserver override or plain
+  :update, or this command's own :drop-index key (`own-drops`) names it
+  (plan-dropped-indexes), or when an earlier command drops the whole table
+  (plan-dropped-tables); a created one when a command after its create, this
+  command's own key included, drops it.
+  The plan is read as-run; names are compared folded (folded-name).  Indexes
+  that back a primary key or a unique constraint are not looked up here: they
+  are constraints, dropped before the column with its other constraints."
+  [table columns own-drops]
+  (let [table-name (catalog-name table)
+        table-key  (folded-name table)
+        plan       (concat (if *plan* @*plan* []) [{:alter-table table :drop-index own-drops}])
+        dropped    (plan-dropped-indexes as-run plan)
+        old-gone   (contains? (plan-dropped-tables as-run plan) table-key)
+        created    (when *db* (plan-created-indexes plan table-key))
+        remaining  (doall (for [column columns
+                                :let [column-key (folded-name column)
+                                      found      (when-not old-gone
+                                                   (remove #(contains? dropped [table-key (folded-name %)])
+                                                           (get-column-indexes *db* table-name (catalog-name column))))]
+                                index (distinct-folded (concat found (for [[index index-columns] created
+                                                                           :when (contains? index-columns column-key)]
+                                                                       index)))]
+                            [(catalog-name column) index]))]
+    (when (seq remaining)
+      (doseq [[column index] remaining]
+        (log/error (format (str "tern: cannot drop column %s.%s on SQL Server: index %s still contains it;"
+                                " drop the index first in this migration (:drop-index), or remove a stale"
+                                " index by hand (see the SQL Server migration runbook, section 5a)")
+                           table-name column index)))
+      (exit! 1))))
 
 (defmethod generate-sql
   :alter-table
@@ -228,15 +732,22 @@
     primary-key :primary-key
     table-options :table-options}]
   (log/info " - Altering table" (log/highlight (name table)))
-  (let [additions
+  (let [;; :drop-index may name one index rather than a collection of them.
+        drop-indices (if (or (nil? drop-indices) (coll? drop-indices)) drop-indices [drop-indices])
+        ;; So may :drop-constraints name one constraint (or :primary-key).
+        drop-constraints (if (or (nil? drop-constraints) (coll? drop-constraints)) drop-constraints [drop-constraints])
+        ;; And :drop-columns one column.
+        drop-columns (if (or (nil? drop-columns) (coll? drop-columns)) drop-columns [drop-columns])
+        ;; The plan an add reads: the earlier commands, then this command's own :drop-columns,
+        ;; whose DROP tern emits before the ADD.
+        add-plan (concat (if *plan* @*plan* []) [{:alter-table table :drop-columns drop-columns}])
+        additions
         (filter identity
                 (for [[column & specs] (map-column-specs add-columns)]
                   (if (and *db*
                            (column-exists? *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))
-                           (not (some (fn [prior]
-                                        (and (= table (:alter-table prior))
-                                             (some (fn [col] (= col column)) (:drop-columns prior))))
-                                      @*plan*)))
+                           ;; Did an earlier command, or this command's own :drop-columns, drop the column or its table?
+                           (not (plan-drops-column? add-plan table column)))
                     (do (log/info (format "   * Skipping ADD COLUMN %s.%s because it already exists."
                                           (to-sql-name table) (to-sql-name column)))
                         nil)
@@ -277,8 +788,8 @@
                   (if (or (not *db*)
                           (not (foreign-key-exists? *db* (to-sql-name constraint)))
                           ;; Did an earlier command drop the constraint, or its table?
-                          (contains? (plan-dropped-constraints @*plan*) [(catalog-name table) (catalog-name constraint)])
-                          (contains? (plan-dropped-tables @*plan*) (catalog-name table)))
+                          (contains? (plan-dropped-constraints as-claimed @*plan*) [(folded-name table) (folded-name constraint)])
+                          (contains? (plan-dropped-tables as-claimed @*plan*) (folded-name table)))
                     (do
                       (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
                       (format "CONSTRAINT %s FOREIGN KEY %s" 
@@ -291,29 +802,10 @@
                      constraint (get-column-constraints *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
                  (do (log/info "    * Removing constraint " (log/highlight constraint))
                      (to-sql-name constraint))))
-        ;; SQL Server refuses to drop a column that an index or a default constraint
-        ;; depends on (error 5074).  Every index the catalog shows on a dropped column
-        ;; gets one statement that drops it only if, when the statement runs, it still
-        ;; contains one of the columns this command drops (drop-index-if-it-holds): the
-        ;; plan cannot say what earlier statements did (a :drop-index whose guard
-        ;; missed, an index re-created by :create-index, raw SQL or an override), the
-        ;; catalog at execution time can.  Only this command's own :drop-index key,
-        ;; which is emitted unconditionally, makes the statement redundant.  Each index found here is added to the plan as
-        ;; a :drop-index, unless the plan already holds that entry, so a later
-        ;; :create-index of the same name is emitted rather than skipped by its guard,
-        ;; which reads the catalog before anything executes and would still find it.
-        dependent-indexes
-        (let [own-drops (set (map catalog-name drop-indices))]
-          (doall (for [index (distinct
-                              (for [column removed-columns
-                                    index (get-column-indexes *db* (to-sql-name table :quote-for-statement false) (to-sql-name column :quote-for-statement false))]
-                                index))
-                       :when (not (own-drops (catalog-name index)))]
-                   (let [entry {:drop-index (keyword index) :on table}]
-                     (log/info "    * Removing index" (log/highlight index) "if it still contains a dropped column")
-                     (when (and *plan* (not (some #{entry} @*plan*)))
-                       (swap! *plan* concat [entry]))
-                     index))))
+        ;; An index that still contains a dropped column stops the migration here, while
+        ;; its SQL is generated: the migration must drop the index first.
+        _ (refuse-indexed-column-drops! table removed-columns drop-indices)
+        ;; SQL Server also refuses to drop a column that a default constraint depends on.
         ;; A default constraint (sys.default_constraints: information_schema does not list
         ;; defaults) is dropped in the same ALTER TABLE statement as its column, which SQL
         ;; Server applies whole or not at all: a column drop that still fails leaves the
@@ -379,9 +871,6 @@
                                                                        (to-sql-name idx)
                                                                        (to-sql-name table)))
                                                              drop-indices)))])
-       (let [columns (map #(to-sql-name % :quote-for-statement false) removed-columns)]
-         (for [index dependent-indexes]
-           (drop-index-if-it-holds table index columns)))
        (mapcat (fn [column]
                  (generate-sql {:alter-table table :modify-column column}))
                modify-columns)
@@ -410,10 +899,7 @@
     table   :on
     columns :columns
     unique  :unique}]
-  (if (and *db*
-           (index-exists? *db* (to-sql-name table) (to-sql-name index))
-           (not (or (contains? (plan-dropped-indexes @*plan*) [(catalog-name table) (catalog-name index)])
-                    (contains? (plan-dropped-tables @*plan*) (catalog-name table)))))
+  (if (create-index-skipped? (if *plan* @*plan* []) table index)
     (do (log/info (format "   * Skipping CREATE INDEX on table %s name %s because it already exists."
                           (to-sql-name table) (to-sql-name index)))
         nil)
@@ -430,11 +916,19 @@
 (defmethod generate-sql
   :drop-index
   [{index :drop-index table :on}]
-  ;; As with drop-column, we are not checking here for create index followed by drop index
-  ;; in the same migration.  Wouldn't make sense.
-  (if (or (not *db*) (index-exists? *db* (to-sql-name table) (to-sql-name index)))
+  ;; The index is there when the catalog, read before the migration runs, shows it: a plain DROP
+  ;; INDEX.  When only the migration's earlier commands hold it (plan-created-index?), the drop is
+  ;; DROP INDEX IF EXISTS, a no-op where the plan reads an index that is not there.
+  (cond
+    (or (not *db*) (index-exists? *db* (to-sql-name table) (to-sql-name index)))
     (do (log/info " - Dropping index" (log/highlight (name index)))
         [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])
+
+    (plan-created-index? (if *plan* @*plan* []) table index)
+    (do (log/info " - Dropping index" (log/highlight (name index)) "created earlier in this migration, if it exists")
+        [(format "DROP INDEX IF EXISTS %s ON %s" (to-sql-name index) (to-sql-name table))])
+
+    :else
     (do (log/info (format "   * Skipping DROP INDEX on table %s index %s because that index does not exist."
                           table index))
         nil)))
