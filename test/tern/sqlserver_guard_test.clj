@@ -19,7 +19,10 @@
   exact (db, table, index), the add-constraints guard's with the foreign-key
   lookup saying yes for the exact (db, constraint), the create-table guard's with
   the table lookup saying yes for the exact (db, table), and the check-constraint
-  lookup by capturing the query it sends."
+  lookup by capturing the query it sends.  The drop-index guard's reading of the
+  plan's creates, a single-keyword :drop-constraints, the add-columns guard's
+  reading of the plan's column and table drops, the whole ALTER TABLE ... DROP
+  list and comments in an override are checked over the same fake catalogs."
   (:require [tern.sqlserver    :as sqlserver]
             [tern.db           :as tern-db]
             [tern.log          :as log]
@@ -800,6 +803,42 @@
                                                    {:create-index :ix_a :on :t :columns [:b]}])
          (after-override ["IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_a') DROP INDEX ix_a ON t"])])
 
+;; Comments are blanked before a clause is read.  The refusal reads only the text without them:
+;; a drop with a comment inside, before or after it runs and is credited (accepted), nested
+;; comments included ...
+(expect [(accepted-after "DROP /* old */ INDEX ix_a ON t")
+         (accepted-after "DROP INDEX ix_a ON t -- gone")
+         (accepted-after "/* tidy /* nested */ up */ DROP INDEX ix_a ON t")]
+        [(after-override ["DROP /* old */ INDEX ix_a ON t"])
+         (after-override ["DROP INDEX ix_a ON t -- gone"])
+         (after-override ["/* tidy /* nested */ up */ DROP INDEX ix_a ON t"])])
+
+;; ... while a drop written only inside a comment does not run and is not credited: inside a
+;; comment that nests (its -- is part of the comment), or commented out before a drop of
+;; another index (refused).
+(expect [(refused-after "/* /* nested */ DROP INDEX ix_a ON t -- */")
+         (refused-after "/* DROP INDEX ix_a ON t */ DROP INDEX ix_b ON t")]
+        [(after-override ["/* /* nested */ DROP INDEX ix_a ON t -- */"])
+         (after-override ["/* DROP INDEX ix_a ON t */ DROP INDEX ix_b ON t"])])
+
+;; The guards read the text as written and without its comments: a comment inside a drop no
+;; longer hides it, so CREATE INDEX ix_b, CREATE TABLE t and the add of fk_x are emitted ...
+(expect [[nil ["CREATE  INDEX ix_b ON t (a)"]]
+         [nil ["CREATE TABLE t (a INT)"]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]]
+        [(create-after [(overriding "DROP /* old */ INDEX ix_b ON t")] :ix_b)
+         (create-table-after [(overriding "DROP TABLE /* old */ t")])
+         (add-constraint-after [(overriding "ALTER TABLE t DROP /* fk */ CONSTRAINT fk_x")] :t)])
+
+;; ... and a drop written only inside a comment still counts for them, and not for the refusal:
+;; after /* DROP INDEX ix_a ON t */ the create-index guard emits CREATE INDEX ix_a, while a drop
+;; of t.a, which ix_a contains, is still refused.
+(expect [{:sql ["/* DROP INDEX ix_a ON t */" "CREATE  INDEX ix_a ON t (b)"] :errors [] :exit nil}
+         (refused-after "/* DROP INDEX ix_a ON t */")]
+        [(migrate-with-dependents [] t-a-index {} [(overriding ["/* DROP INDEX ix_a ON t */"])
+                                                   {:create-index :ix_a :on :t :columns [:b]}])
+         (after-override ["/* DROP INDEX ix_a ON t */"])])
+
 ;; The override readers fold too: a DROP TABLE T lets CREATE TABLE t through, and an ALTER
 ;; TABLE T DROP CONSTRAINT FK_X has fk_x added again.
 (expect [[nil ["CREATE TABLE t (a INT)"]]
@@ -836,15 +875,54 @@
          (add-constraint-after [(overriding "ALTER TABLE t DROP CONSTRAINT fk_a, COLUMN fk_b")] :t [:fk_b] #{"fk_b"})
          (add-constraint-after [(overriding "ALTER TABLE t DROP COLUMN fk_x")] :t)])
 
-;; COLUMN and PERIOD end a constraint list, as T-SQL drops them in the same statement:
-;; ALTER TABLE t DROP COLUMN a drops no constraint, and tern's own DROP constraint if exists
-;; DF_t_a, column a drops DF_t_a alone.  (The reader is looked up when the test runs, so this
-;; file still loads against an older generator that lacks it.)
+;; A COLUMN item names a column, not a constraint: ALTER TABLE t DROP COLUMN a drops no
+;; constraint, and tern's own DROP constraint if exists DF_t_a, column a drops DF_t_a alone.
+;; (The reader is looked up when the test runs, so this file still loads against an older
+;; generator that lacks it.)
 (expect [#{} #{["t" "df_t_a"]}]
         (let [read-constraints (ns-resolve 'tern.sqlserver 'plan-dropped-constraints)
               claimed          (ns-resolve 'tern.sqlserver 'as-claimed)]
           [(read-constraints claimed [(overriding "ALTER TABLE t DROP COLUMN a")])
            (read-constraints claimed [(overriding "ALTER TABLE t DROP constraint if exists DF_t_a, column a")])]))
+
+;; The guards read the whole ALTER TABLE ... DROP list, as T-SQL mixes constraints, columns and
+;; a period in one drop: fk_x after a COLUMN item, after a WITH (...) option (ONLINE, or MOVE
+;; TO with its own parentheses), between two COLUMN items, or after PERIOD FOR SYSTEM_TIME is
+;; dropped, and the add-constraints guard adds it again.
+(expect [[[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+         [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]]
+        [(add-constraint-after [(overriding "ALTER TABLE t DROP COLUMN a, CONSTRAINT fk_x")] :t)
+         (add-constraint-after [(overriding "ALTER TABLE t DROP CONSTRAINT fk_a WITH (ONLINE = ON), CONSTRAINT fk_x")] :t)
+         (add-constraint-after [(overriding "ALTER TABLE t DROP fk_a WITH (MOVE TO ps(a)), fk_x")] :t)
+         (add-constraint-after [(overriding "ALTER TABLE t DROP COLUMN a, CONSTRAINT fk_a, COLUMN c, CONSTRAINT fk_x")] :t)
+         (add-constraint-after [(overriding "ALTER TABLE t DROP PERIOD FOR SYSTEM_TIME, fk_x")] :t)])
+
+;; Each item is read as what it is: every name after COLUMN, up to the next keyword, is a
+;; column (DROP COLUMN a, fk_x drops the column fk_x); a WITH (...) or PERIOD FOR SYSTEM_TIME
+;; names no constraint; and fk_x dropped on u is not fk_x on t.  The guard skips the add while
+;; the catalog shows fk_x.
+(expect [[[] []] [[] []] [[] []] [[] []]]
+        [(add-constraint-after [(overriding "ALTER TABLE t DROP COLUMN a, fk_x")] :t)
+         (add-constraint-after [(overriding "ALTER TABLE t DROP CONSTRAINT fk_a WITH (ONLINE = ON)")] :t)
+         (add-constraint-after [(overriding "ALTER TABLE t DROP PERIOD FOR SYSTEM_TIME")] :t)
+         (add-constraint-after [(overriding "ALTER TABLE u DROP COLUMN a, CONSTRAINT fk_x")] :t)])
+
+;; Item by item, the two readers of a list: tern's own DROP constraint if exists DF_t_a, column
+;; a,b drops the constraint DF_t_a and the columns a and b; a qualified table with IF EXISTS,
+;; WITH, a bracketed column, PERIOD FOR SYSTEM_TIME and a double-quoted constraint after it
+;; drops fk_a and fk_b and the columns c and d.  (The readers are looked up when the test
+;; runs, so this file still loads against an older generator that lacks them.)
+(expect [[#{["t" "df_t_a"]} #{["t" "a"] ["t" "b"]}]
+         [#{["t" "fk_a"] ["t" "fk_b"]} #{["t" "c"] ["t" "d"]}]]
+        (let [read-constraints (ns-resolve 'tern.sqlserver 'plan-dropped-constraints)
+              read-columns     (ns-resolve 'tern.sqlserver 'plan-dropped-columns)
+              claimed          (ns-resolve 'tern.sqlserver 'as-claimed)]
+          (vec (for [sql ["ALTER TABLE t DROP constraint if exists DF_t_a, column a,b"
+                          "ALTER TABLE [dbo].[t] DROP CONSTRAINT IF EXISTS fk_a WITH (MOVE TO ps([a])), COLUMN IF EXISTS c, [d], PERIOD FOR SYSTEM_TIME, \"fk_b\""]]
+                 [(read-constraints claimed [(overriding sql)]) (read-columns claimed [(overriding sql)])]))))
 
 ;; As whole statements the refusal reads these lists too, every drop of them: tern's
 ;; multi-index form, the legacy form, a comma list of tables, each dropping ix_a or t
@@ -931,6 +1009,101 @@
 (expect [["drop index if exists x on t,y on t"] ["drop index if exists x on t"]]
         [(vec (sqlserver/generate-sql {:alter-table :t :drop-index [:x :y]}))
          (vec (sqlserver/generate-sql {:alter-table :t :drop-index "x"}))])
+
+;; The :drop-constraints key may name a single constraint too, as a keyword or a string, or the
+;; primary key as :primary-key: each emits its drop, without an exception.
+(expect [["ALTER TABLE t DROP constraint if exists fk_x"]
+         ["ALTER TABLE t DROP constraint if exists fk_x"]
+         ["ALTER TABLE t DROP constraint if exists PK_t"]]
+        (with-redefs [sqlserver/foreign-key-exists? (fn [d c] (and (= d db) (= c "fk_x")))
+                      sqlserver/get-primary-key     (fn [d t] (when (= [d t] [db "t"]) "PK_t"))]
+          (binding [sqlserver/*db*   db
+                    sqlserver/*plan* (atom [])]
+            (vec (for [k [:fk_x "fk_x" :primary-key]]
+                   (vec (sqlserver/generate-sql {:alter-table :t :drop-constraints k})))))))
+
+;; ... and only that one: a keyword naming a constraint the catalog does not show is skipped,
+;; as it is in a vector; a keyword drop of fk_x lets a later add of fk_x through.
+(expect [[]
+         ["ALTER TABLE t DROP constraint if exists fk_x"
+          "ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]
+        [(:sql (migrate-over-fks #{"fk_x"} [{:alter-table :t :drop-constraints :fk_y}]))
+         (:sql (migrate-over-fks #{"fk_x"} [{:alter-table :t :drop-constraints :fk_x}
+                                            {:alter-table :t :add-constraints [[:fk_x "(a) REFERENCES u(id)"]]}]))])
+
+;; ---------------------------------------------------------------------------
+;; :add-columns reads the plan as the other guards do: it skips adding a column the catalog
+;; already shows only when no earlier command, nor the command's own :drop-columns, drops the
+;; column or its table, read as-claimed, the names compared folded.
+
+(defn- adding-a
+  "An :alter-table command adding column a (INT) to t."
+  []
+  {:alter-table :t :add-columns [[:a "INT"]]})
+
+;; Dropped and added again in one command: tern emits the DROP before the ADD, so the add is
+;; emitted though the catalog shows the column.  The command dropping another column, or
+;; nothing, leaves the add skipped.
+(expect [["ALTER TABLE t DROP column a" "ALTER TABLE t ADD a INT"]
+         ["ALTER TABLE t DROP column b"]
+         []]
+        [(:sql (migrate-with-dependents [] {} {} [(assoc (adding-a) :drop-columns [:a])]))
+         (:sql (migrate-with-dependents [] {} {} [(assoc (adding-a) :drop-columns [:b])]))
+         (:sql (migrate-with-dependents [] {} {} [(adding-a)]))])
+
+;; A drop and a create of the table, and then an add of a column the old table had: the add is
+;; emitted, though the catalog, read before anything runs, shows the old table's column.  After
+;; a drop of another table it is skipped.
+(expect [["DROP TABLE t" "CREATE TABLE t (id INT NOT NULL)" "ALTER TABLE t ADD a INT"]
+         ["DROP TABLE u"]]
+        [(migrate-over-catalog {:tables #{"t"} :columns #{["t" "a"]}}
+                               [{:drop-table :t} {:create-table :t :columns [[:id "INT" "NOT NULL"]]} (adding-a)])
+         (migrate-over-catalog {:tables #{"t" "u"} :columns #{["t" "a"]}}
+                               [{:drop-table :u} (adding-a)])])
+
+;; An earlier override's ALTER TABLE t DROP COLUMN a lets the add through; one that drops
+;; another column of t, or a of another table, leaves it skipped.
+(expect [["ALTER TABLE t DROP COLUMN a" "ALTER TABLE t ADD a INT"]
+         ["ALTER TABLE t DROP COLUMN b"]
+         ["ALTER TABLE u DROP COLUMN a"]]
+        (vec (for [sql ["ALTER TABLE t DROP COLUMN a" "ALTER TABLE t DROP COLUMN b" "ALTER TABLE u DROP COLUMN a"]]
+               (migrate-over-catalog {:columns #{["t" "a"]}} [(overriding sql) (adding-a)]))))
+
+;; The column is read in every form a drop list takes, behind a condition too, as the guards
+;; read: after a constraint, second in a COLUMN list with IF EXISTS, bracketed on a qualified
+;; table, behind IF COL_LENGTH(...), and in tern's own emitted form; the add is emitted after
+;; each.  A constraint named a, or a name after CONSTRAINT, is not the column: skipped.
+(expect [["ALTER TABLE t ADD a INT"] ["ALTER TABLE t ADD a INT"] ["ALTER TABLE t ADD a INT"]
+         ["ALTER TABLE t ADD a INT"] ["ALTER TABLE t ADD a INT"] [] []]
+        (vec (for [sql ["ALTER TABLE t DROP CONSTRAINT fk_x, COLUMN a"
+                        "ALTER TABLE t DROP COLUMN IF EXISTS b, a"
+                        "ALTER TABLE [dbo].[T] DROP COLUMN [A]"
+                        "IF COL_LENGTH('t', 'a') IS NOT NULL ALTER TABLE t DROP COLUMN a"
+                        "ALTER TABLE t DROP constraint if exists DF_t_a, column a"
+                        "ALTER TABLE t DROP CONSTRAINT a"
+                        "ALTER TABLE t DROP COLUMN b, CONSTRAINT a"]]
+               (vec (rest (migrate-over-catalog {:columns #{["t" "a"]}} [(overriding sql) (adding-a)]))))))
+
+;; An earlier :alter-table's :drop-columns counts by the folded catalog names, as the catalog
+;; compares them: a drop of :A on :T, or of "a" on "t", is a drop of t.a and the add is
+;; emitted; a drop of b is not, and the add is skipped.
+(expect [["ALTER TABLE T DROP column A" "ALTER TABLE t ADD a INT"]
+         ["ALTER TABLE t DROP column a" "ALTER TABLE t ADD a INT"]
+         ["ALTER TABLE t DROP column b"]]
+        (vec (for [drop [{:alter-table :T :drop-columns [:A]}
+                         {:alter-table "t" :drop-columns ["a"]}
+                         {:alter-table :t :drop-columns [:b]}]]
+               (:sql (migrate-with-dependents [] {} {} [drop (adding-a)])))))
+
+;; A command with an override counts its :drop-columns key only where the override names the
+;; column, as the other guards count a key: an override that renames t.a away lets the add
+;; through; one that never mentions a leaves the add skipped, as SQL Server keeps the column.
+(expect [["EXEC sp_rename 't.a', 'a_old', 'COLUMN'" "ALTER TABLE t ADD a INT"]
+         ["drop trigger if exists x"]]
+        [(migrate-over-catalog {:columns #{["t" "a"]}}
+                               [{:alter-table :t :drop-columns [:a] :sqlserver "EXEC sp_rename 't.a', 'a_old', 'COLUMN'"} (adding-a)])
+         (migrate-over-catalog {:columns #{["t" "a"]}}
+                               [{:alter-table :t :drop-columns [:a] :sqlserver "drop trigger if exists x"} (adding-a)])])
 
 ;; ---------------------------------------------------------------------------
 ;; The plan's names are compared with the catalog's folded: SQL Server's default collation
@@ -1074,6 +1247,14 @@
         [(migrate-with-dependents [] {} t-a-default [{:update "CREATE INDEX ix_n ON t (b)"} (dropping :t :a)])
          (migrate-with-dependents [] {} t-a-default [{:update "CREATE INDEX ix_n ON u (a)"} (dropping :t :a)])])
 
+;; The create reader reads both texts too: a CREATE INDEX with comments inside it counts by its
+;; key columns (refused), and a column written only inside a comment of its list does not
+;; (accepted).
+(expect [(refused-by "ix_n" "CREATE /* new */ INDEX ix_n ON t (b, /* key */ a)")
+         (accepted-after "CREATE INDEX ix_n ON t (b /* , a */)")]
+        [(after-create-override ["CREATE /* new */ INDEX ix_n ON t (b, /* key */ a)"])
+         (after-create-override ["CREATE INDEX ix_n ON t (b /* , a */)"])])
+
 ;; Order is read command by command: the rebuild idiom, one override dropping ix_n and
 ;; creating it again on a, leaves ix_n on a when the column drop runs (refused); an override
 ;; that creates ix_n and then drops it again still counts as creating it, a false refusal the
@@ -1137,16 +1318,16 @@
                                   {:create-index :ix_n :on :t :columns [:a]}
                                   (dropping :t :a)]))
 
-;; A {:drop-index i :on t} command's guard reads the catalog as it was before the migration:
-;; where that catalog holds no index of the name, the command emits nothing, the index the
-;; migration created stays, and the column drop is refused ...
-(expect (refused-by "ix_n" "CREATE  INDEX ix_n ON t (a)")
+;; A {:drop-index i :on t} command's guard emits its DROP INDEX for an index an earlier command
+;; of the migration creates, though the catalog, read before the migration, holds no index of
+;; the name: the created index is dropped, and the column drop is accepted ...
+(expect (accepted-after "CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t")
         (migrate-with-dependents [] {} t-a-default [{:create-index :ix_n :on :t :columns [:a]}
                                                     {:drop-index :ix_n :on :t}
                                                     (dropping :t :a)]))
 
-;; ... while where it holds one (on b here, dropped and created again on a), the command emits
-;; its DROP INDEX, which drops the created index: accepted.
+;; ... and so it is where the catalog holds one (on b here, dropped and created again on a):
+;; the command emits its DROP INDEX, which drops the created index: accepted.
 (expect (accepted-after "drop index if exists ix_n on t" "CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t")
         (migrate-with-dependents [] {["t" "b"] ["ix_n"]} t-a-default [{:alter-table :t :drop-index [:ix_n]}
                                                                       {:create-index :ix_n :on :t :columns [:a]}
@@ -1172,6 +1353,60 @@
                                                     (dropping :t :a)])
          (migrate-with-dependents [] {["t" "a"] ["ix_n"]} t-a-default [(overriding "CREATE INDEX ix_n ON t (a)")
                                                                       (dropping :t :a)])])
+
+;; ---------------------------------------------------------------------------
+;; The drop-index guard reads the plan's creates as the refusal does: a {:drop-index i :on t}
+;; emits its DROP INDEX when the catalog, read before the migration runs, shows the index, or
+;; when an earlier command of the migration creates it and no command between drops it again
+;; or drops its table.
+
+;; The shape: over a catalog that holds no ix_n, a :create-index of ix_n and then a
+;; {:drop-index :ix_n :on :t} emit both statements.
+(expect ["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
+        (:sql (migrate-with-dependents [] {} {} [{:create-index :ix_n :on :t :columns [:a]} {:drop-index :ix_n :on :t}])))
+
+;; A drop of an index neither the catalog nor the plan holds still emits nothing: alone, after
+;; a create of ix_n on another table, or after a create of another index on t.
+(expect [[] ["CREATE  INDEX ix_n ON u (a)"] ["CREATE  INDEX ix_m ON t (a)"]]
+        [(:sql (migrate-with-dependents [] {} {} [{:drop-index :ix_n :on :t}]))
+         (:sql (migrate-with-dependents [] {} {} [{:create-index :ix_n :on :u :columns [:a]} {:drop-index :ix_n :on :t}]))
+         (:sql (migrate-with-dependents [] {} {} [{:create-index :ix_m :on :t :columns [:a]} {:drop-index :ix_n :on :t}]))])
+
+;; A create in an override or an :update counts as the refusal counts it, and the names
+;; compare folded: a create of :IX-N on :T is the ix_n on t the drop names.
+(expect [["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
+         ["CREATE INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
+         ["CREATE  INDEX IX_N ON T (a)" "DROP INDEX ix_n ON t"]]
+        [(:sql (migrate-with-dependents [] {} {} [(overriding "CREATE INDEX ix_n ON t (a)") {:drop-index :ix_n :on :t}]))
+         (:sql (migrate-with-dependents [] {} {} [{:update "CREATE INDEX ix_n ON t (a)"} {:drop-index :ix_n :on :t}]))
+         (:sql (migrate-with-dependents [] {} {} [{:create-index :IX-N :on :T :columns [:a]} {:drop-index :ix_n :on :t}]))])
+
+;; Once a command after the create drops the index, a later {:drop-index} of it emits nothing:
+;; a first {:drop-index} of it (create, drop, drop again), an :alter-table's :drop-index key, a
+;; DROP INDEX in an override, or a drop of the table, each between the create and the drop.
+(expect [["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
+         ["CREATE  INDEX ix_n ON t (a)" "drop index if exists ix_n on t"]
+         ["CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t"]
+         ["CREATE  INDEX ix_n ON t (a)" "DROP TABLE t"]]
+        (vec (for [between [{:drop-index :ix_n :on :t}
+                            {:alter-table :t :drop-index [:ix_n]}
+                            (overriding "DROP INDEX ix_n ON t")
+                            {:drop-table :t}]]
+               (:sql (migrate-with-dependents [] {} {} [{:create-index :ix_n :on :t :columns [:a]}
+                                                        between
+                                                        {:drop-index :ix_n :on :t}])))))
+
+;; A create that does not run counts for nothing: after a :create-index whose override is
+;; empty, or creates another index, the drop of ix_n emits nothing.  A create its guard skips,
+;; because the catalog holds ix_n (on b here), creates nothing either, and the drop is emitted
+;; on the catalog's word, as the catalog's index is there.
+(expect [[] ["CREATE INDEX ix_m ON t (a)"] ["DROP INDEX ix_n ON t"]]
+        [(:sql (migrate-with-dependents [] {} {} [{:create-index :ix_n :on :t :columns [:a] :sqlserver []}
+                                                 {:drop-index :ix_n :on :t}]))
+         (:sql (migrate-with-dependents [] {} {} [{:create-index :ix_n :on :t :columns [:a] :sqlserver "CREATE INDEX ix_m ON t (a)"}
+                                                 {:drop-index :ix_n :on :t}]))
+         (:sql (migrate-with-dependents [] {["t" "b"] ["ix_n"]} {} [{:create-index :ix_n :on :t :columns [:a]}
+                                                                   {:drop-index :ix_n :on :t}]))])
 
 ;; Without a connection nothing is refused: there is no catalog, and the generators emit
 ;; their statements unguarded.
