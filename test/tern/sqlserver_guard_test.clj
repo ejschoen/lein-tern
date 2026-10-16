@@ -763,6 +763,12 @@
          (add-constraint-after [{:alter-table :t :drop-constraints [:fk_x] :sqlserver ["ALTER TABLE t DROP CONSTRAINT fk_x"]}] :t)
          (add-constraint-after [{:alter-table :t :drop-constraints [:fk_x] :sqlserver ["EXEC sp_rename 'fk_x', 'fk_x_old', 'OBJECT'"]}] :t)])
 
+;; A mention counts in any spelling of the name: given only bracketed, or only double-quoted,
+;; inside the override's text, fk_x's key counts and fk_x is added again.
+(expect [[[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]] [[] ["ALTER TABLE t ADD CONSTRAINT fk_x FOREIGN KEY (a) REFERENCES u(id)"]]]
+        [(add-constraint-after [{:alter-table :t :drop-constraints [:fk_x] :sqlserver ["EXEC sp_rename N'[fk_x]', 'fk_x_old', 'OBJECT'"]}] :t)
+         (add-constraint-after [{:alter-table :t :drop-constraints [:fk_x] :sqlserver ["EXEC sp_rename N'\"fk_x\"', 'fk_x_old', 'OBJECT'"]}] :t)])
+
 ;; The add-constraints and create-index guards read a table drop as the guards do: after a
 ;; :drop-table whose override drops t if it exists, fk_x is added again and CREATE INDEX x is
 ;; emitted.
@@ -814,6 +820,11 @@
          (add-constraint-after [(overriding "ALTER TABLE t DROP CONSTRAINT fk_a, CONSTRAINT fk_b")] :t [:fk_b] #{"fk_b"})
          (add-constraint-after [(overriding "ALTER TABLE t DROP fk_x")] :t)
          (create-after [(overriding "DROP INDEX t.ix_b")] :ix_b)])
+
+;; The first table of a list counts as much as the second: DROP TABLE t, b lets CREATE TABLE
+;; t through.
+(expect [nil ["CREATE TABLE t (a INT)"]]
+        (create-table-after [(overriding "DROP TABLE t, b")]))
 
 ;; A list that names its drop targets reads no other name: ix_b dropped on u, not t; the
 ;; legacy form on u; tables a and u; fk_b a column, not a constraint; fk_x a column dropped
