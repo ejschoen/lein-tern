@@ -826,6 +826,11 @@
         (migrate-with-dependents [] {["t" "a"] ["ix__a"]} t-a-default [(overriding ["DROP INDEX [ix--a] ON t"])
                                                                       (dropping :t :a)]))
 
+;; ... and a comment marker glued to a bare name starts a comment: DROP INDEX ix_a ON t--gone,
+;; read without its comment, drops ix_a on t (accepted), whatever the text as written reads.
+(expect (accepted-after "DROP INDEX ix_a ON t--gone")
+        (after-override ["DROP INDEX ix_a ON t--gone"]))
+
 ;; ... while a drop written only inside a comment does not run and is not credited: inside a
 ;; comment that nests (its -- is part of the comment), or commented out before a drop of
 ;; another index (refused).

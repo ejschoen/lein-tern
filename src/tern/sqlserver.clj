@@ -276,20 +276,21 @@
   (memoize (fn [clause] (re-pattern (str "\\s*(?:" clause ")\\s*;?\\s*")))))
 
 (defn- whole-statement
-  "The match of `clause` when `statement`, as written or with its comments
-  blanked (blank-comments), is that clause alone, as a seq of at most one match:
-  a clause behind a condition or after other text is not read, a comment inside,
-  before or after it does not hide it, and a clause written only inside a
-  comment is not read.  The text as written is matched first, so a `--` or `/*`
-  inside a delimited name ([ix--a]), which blanking would cut, does not hide the
-  drop.  Both readings move this one towards crediting a drop more often, but
-  only a drop that runs: the column-drop refusal reads the plan this way
-  (as-run), and a drop it credits must run, or the column drop it lets through
-  fails (error 5074), while a drop it misses only refuses a migration that would
-  have run."
+  "The matches of `clause` when `statement`, as written or with its comments
+  blanked (blank-comments), is that clause alone, as a seq of at most two
+  matches: a clause behind a condition or after other text is not read, a
+  comment inside, before or after it does not hide it, and a clause written only
+  inside a comment is not read.  Both texts are matched and their matches joined
+  (distinct), as anywhere joins them, so a `--` or `/*` inside a delimited name
+  ([ix--a]) is read from the text as written and a name glued to a comment
+  marker (t--gone) from the blanked text.  Both readings move this one towards
+  crediting a drop more often, but only a drop that runs: the column-drop
+  refusal reads the plan this way (as-run), and a drop it credits must run, or
+  the column drop it lets through fails (error 5074), while a drop it misses
+  only refuses a migration that would have run."
   [clause statement]
   (let [pattern (whole-statement-pattern clause)]
-    (some-> (or (re-matches pattern statement) (re-matches pattern (blank-comments statement))) list)))
+    (distinct (remove nil? [(re-matches pattern statement) (re-matches pattern (blank-comments statement))]))))
 
 (defn- anywhere
   "Every match of `clause` anywhere in `statement`, behind a condition included,
