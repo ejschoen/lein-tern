@@ -1385,8 +1385,9 @@
                                                     (dropping :t :a)]))
 
 ;; ... and so it is where the catalog holds one (on b here, dropped and created again on a):
-;; the command emits its DROP INDEX, which drops the created index: accepted.
-(expect (accepted-after "drop index if exists ix_n on t" "CREATE  INDEX ix_n ON t (a)" "DROP INDEX ix_n ON t")
+;; the command emits its DROP INDEX, which drops the created index: accepted.  The catalog's
+;; ix_n was dropped by an earlier command, so the drop is guarded (oi46).
+(expect (accepted-after "drop index if exists ix_n on t" "CREATE  INDEX ix_n ON t (a)" "DROP INDEX IF EXISTS ix_n ON t")
         (migrate-with-dependents [] {["t" "b"] ["ix_n"]} t-a-default [{:alter-table :t :drop-index [:ix_n]}
                                                                       {:create-index :ix_n :on :t :columns [:a]}
                                                                       {:drop-index :ix_n :on :t}
@@ -1857,3 +1858,34 @@
 ;; in four) has every one of them checked.
 (expect [["i1" "i2" "i3"] ["i1" "i2" "i3"]]
         (lookups-on-three-rows))
+
+;; ---------------------------------------------------------------------------
+;; oi46: the catalog, read before the migration runs, still shows an index that an earlier command of
+;; the migration drops.  The drop-index guard then emits DROP INDEX IF EXISTS, not a plain DROP INDEX
+;; that would fail with error 3701; an earlier drop of another index, or none, leaves the plain drop.
+
+(defn- drop-after-oi46
+  "oi46: generate-sql for {:drop-index index :on :t} with *db* bound and the guard saying yes only for
+  the bound db, table t and the indexes ix_a and ix_b, after the earlier commands `plan`."
+  [plan index]
+  (with-redefs [sqlserver/index-exists? (fn [d t i] (and (= [d t] [db "t"]) (contains? #{"ix_a" "ix_b"} i)))]
+    (binding [sqlserver/*db*   db
+              sqlserver/*plan* (atom plan)]
+      (sqlserver/generate-sql {:drop-index index :on :t}))))
+
+;; oi46: after a plain :update that drops ix_a, the drop of ix_a is guarded; with no earlier drop it is
+;; the plain DROP INDEX.
+(expect [["DROP INDEX ix_a ON t"] ["DROP INDEX IF EXISTS ix_a ON t"]]
+        [(drop-after-oi46 [] :ix_a)
+         (drop-after-oi46 [{:update "DROP INDEX ix_a ON t"}] :ix_a)])
+
+;; oi46 twin, a second index: the same earlier drop of ix_a leaves the drop of ix_b plain.
+(expect ["DROP INDEX ix_b ON t"]
+        (drop-after-oi46 [{:update "DROP INDEX ix_a ON t"}] :ix_b))
+
+;; oi46: an earlier {:drop-index ...} command, an :alter-table's own :drop-index key and a drop of the
+;; whole table count as that drop too.
+(expect [["DROP INDEX IF EXISTS ix_a ON t"] ["DROP INDEX IF EXISTS ix_a ON t"] ["DROP INDEX IF EXISTS ix_a ON t"]]
+        [(drop-after-oi46 [{:drop-index :ix_a :on :t}] :ix_a)
+         (drop-after-oi46 [{:alter-table :t :drop-index [:ix_a]}] :ix_a)
+         (drop-after-oi46 [{:drop-table :t}] :ix_a)])

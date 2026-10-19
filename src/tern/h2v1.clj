@@ -47,9 +47,25 @@
   (when primary-key
     (format "PRIMARY KEY (%s)" (to-sql-list primary-key))))
 
+(defn inline-constraints
+  "The foreign keys a `:create-table` writes inside itself, each `[name & specs]`:
+  those under `:constraints`, then those under `:add-constraints` (the key the
+  `:alter-table` generator reads, which migrations also write inside a
+  create-table).  Nil when it writes none."
+  [{:keys [constraints add-constraints]}]
+  (seq (concat constraints add-constraints)))
+
+(defn- as-list
+  "A `:drop-columns` or `:drop-constraints` value as a collection: a single
+  column or constraint, written as a keyword or a string, becomes a one-element
+  vector; a collection, or nil, is itself."
+  [x]
+  (if (or (nil? x) (coll? x)) x [x]))
+
 (defn generate-constraints
-  [{:keys [constraints] :as command}]
-  (let [fks 
+  [command]
+  (let [constraints (inline-constraints command)
+        fks
         (when constraints
           (for [[constraint & specs] constraints]
             (do
@@ -88,7 +104,7 @@
                 (generate-sql {:alter-table table
                                :table-options table-options
                                :add-columns columns
-                               :add-constraints (:constraints command)}))
+                               :add-constraints (inline-constraints command)}))
          (apply conj
                 [(format "ALTER TABLE %s ADD %s" (to-sql-name table) pk)]
                 (generate-sql {:alter-table table
@@ -114,7 +130,11 @@
     add-constraints :add-constraints  drop-constraints :drop-constraints primary-key :primary-key
     table-options :table-options character-set :character-set}]
   (log/info " - Altering table" (log/highlight (name table)))
-  (let [additions
+  (let [;; :drop-columns and :drop-constraints may name one column or constraint rather than a
+        ;; collection of them, here and in the earlier commands of the plan.
+        drop-columns (as-list drop-columns)
+        drop-constraints (as-list drop-constraints)
+        additions
         (when (not-empty add-columns)
           [(format "alter table %s add column (%s)"
                    (to-sql-name table)
@@ -125,7 +145,7 @@
                                               (column-exists? *db* (to-sql-name table) (to-sql-name column))
                                               (not (some (fn [prior]
                                                            (and (= table (:alter-table prior))
-                                                                (some (fn [col] (= col column)) (:drop-columns prior))))
+                                                                (some (fn [col] (= col column)) (as-list (:drop-columns prior)))))
                                                          @*plan*)))
                                        (do (log/info (format "   * Skipping ADD COLUMN %s.%s because it already exists."
                                                              (to-sql-name table) (to-sql-name column)))
@@ -162,7 +182,7 @@
                   (some (fn [prior]
                           (some (fn [to-drop]
                                   (= :primary-key to-drop))
-                                (:drop-constraints prior)))
+                                (as-list (:drop-constraints prior))))
                         @*plan*))
             (do (log/info "   * Adding primary key to table " (log/highlight table))
                 [(format "ALTER TABLE %S ADD %s"
@@ -186,7 +206,7 @@
                                                                                         (some (fn [to-drop]
                                                                                                 (= (s/upper-case (to-sql-name to-drop))
                                                                                                    (s/upper-case (to-sql-name existing))))
-                                                                                              (:drop-constraints prior)))
+                                                                                              (as-list (:drop-constraints prior))))
                                                                                       @*plan*)))
                                                                          existing-constraints)]
                               (if (or (not *db*)
@@ -195,7 +215,7 @@
                                               ;; Did we previously drop the constraint?
                                               (and (= table (:alter-table prior))
                                                    (some (fn [cons] (= cons constraint))
-                                                         (:drop-constraints prior))))
+                                                         (as-list (:drop-constraints prior)))))
                                             @*plan*))
                                 (do
                                   (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))

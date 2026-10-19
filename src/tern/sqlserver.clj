@@ -33,9 +33,18 @@
   (when primary-key
     (format "PRIMARY KEY (%s)" (to-sql-list primary-key))))
 
+(defn inline-constraints
+  "The foreign keys a `:create-table` writes inside itself, each `[name & specs]`:
+  those under `:constraints`, then those under `:add-constraints` (the key the
+  `:alter-table` generator reads, which migrations also write inside a
+  create-table).  Nil when it writes none."
+  [{:keys [constraints add-constraints]}]
+  (seq (concat constraints add-constraints)))
+
 (defn generate-constraints
-  [{:keys [constraints] :as command}]
-  (let [fks 
+  [command]
+  (let [constraints (inline-constraints command)
+        fks
         (when constraints
           (for [[constraint & specs] constraints]
             (do
@@ -144,7 +153,7 @@
                 (generate-sql {:alter-table table
                                :table-options table-options
                                :add-columns columns
-                               :add-constraints (:constraints command)}))
+                               :add-constraints (inline-constraints command)}))
          (apply conj
                 [(format "ALTER TABLE %s ADD %s" (to-sql-name table) pk)]
                 (generate-sql {:alter-table table
@@ -917,12 +926,25 @@
   :drop-index
   [{index :drop-index table :on}]
   ;; The index is there when the catalog, read before the migration runs, shows it: a plain DROP
-  ;; INDEX.  When only the migration's earlier commands hold it (plan-created-index?), the drop is
-  ;; DROP INDEX IF EXISTS, a no-op where the plan reads an index that is not there.
+  ;; INDEX, unless an earlier command of the migration already drops it or its table (read as-run,
+  ;; a drop that runs before this one): the catalog is then stale, and the drop is DROP INDEX IF
+  ;; EXISTS, which removes the index if a command between created it again and otherwise does
+  ;; nothing, where a plain DROP INDEX would fail with error 3701.  When only the migration's
+  ;; earlier commands hold it (plan-created-index?), the drop is DROP INDEX IF EXISTS too, a no-op
+  ;; where the plan reads an index that is not there.
   (cond
-    (or (not *db*) (index-exists? *db* (to-sql-name table) (to-sql-name index)))
+    (not *db*)
     (do (log/info " - Dropping index" (log/highlight (name index)))
         [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])
+
+    (index-exists? *db* (to-sql-name table) (to-sql-name index))
+    (let [plan (if *plan* @*plan* [])]
+      (if (or (contains? (plan-dropped-indexes as-run plan) [(folded-name table) (folded-name index)])
+              (contains? (plan-dropped-tables as-run plan) (folded-name table)))
+        (do (log/info " - Dropping index" (log/highlight (name index)) "an earlier command in this migration dropped, if it exists")
+            [(format "DROP INDEX IF EXISTS %s ON %s" (to-sql-name index) (to-sql-name table))])
+        (do (log/info " - Dropping index" (log/highlight (name index)))
+            [(format "DROP INDEX %s ON %s" (to-sql-name index) (to-sql-name table))])))
 
     (plan-created-index? (if *plan* @*plan* []) table index)
     (do (log/info " - Dropping index" (log/highlight (name index)) "created earlier in this migration, if it exists")
