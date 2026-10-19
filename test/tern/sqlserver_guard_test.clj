@@ -1883,6 +1883,12 @@
 (expect ["DROP INDEX ix_b ON t"]
         (drop-after-oi46 [{:update "DROP INDEX ix_a ON t"}] :ix_b))
 
+;; oi46: a drop inside a larger statement counts too, read as the create-index guard reads the plan: an
+;; :update that drops ix_a behind a condition, and an override that drops it before another statement.
+(expect [["DROP INDEX IF EXISTS ix_a ON t"] ["DROP INDEX IF EXISTS ix_a ON t"]]
+        [(drop-after-oi46 [{:update "IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_a') DROP INDEX ix_a ON t"}] :ix_a)
+         (drop-after-oi46 [{:sqlserver "DROP INDEX ix_a ON t; SELECT 1"}] :ix_a)])
+
 ;; oi46: an earlier {:drop-index ...} command, an :alter-table's own :drop-index key and a drop of the
 ;; whole table count as that drop too.
 (expect [["DROP INDEX IF EXISTS ix_a ON t"] ["DROP INDEX IF EXISTS ix_a ON t"] ["DROP INDEX IF EXISTS ix_a ON t"]]

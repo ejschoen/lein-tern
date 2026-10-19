@@ -25,6 +25,11 @@
 (expect [[:unknown-keys [:modify_columns]]]
         (problems {:alter-table :t :modify_columns [[:c "INT"]]}))
 
+;; The singular :modify-column, which the SQL Server generator builds for its own recursion and a
+;; migration never writes, is a key no generator reads from a file: the likeliest typo of :modify-columns.
+(expect [[:unknown-keys [:modify-column]]]
+        (problems {:alter-table :t :modify-column [:c "INT"]}))
+
 ;; A command with no command key; it has no offending key of its own.
 (expect [[:no-command-key []]]
         (problems {:drop-constraints [:fk_x]}))
@@ -47,7 +52,7 @@
         (problems {:create-table :t :columns [] :primary-key [:id] :constraints [] :add-constraints []
                    :table-options [] :sqlserver "x"}
                   {:drop-table :t :mysql "x" :h2 "x"}
-                  {:alter-table :t :add-columns [] :drop-columns [] :modify-columns [] :modify-column [:c "INT"]}
+                  {:alter-table :t :add-columns [] :drop-columns [] :modify-columns []}
                   {:alter-table :t :alter-columns [] :add-constraints [] :drop-constraints [] :drop-index []}
                   {:alter-table :t :primary-key [:id] :table-options [] :character-set {} :postgresql "x" :sqlite "x"}
                   {:create-index :i :on :t :columns [:c] :unique true}

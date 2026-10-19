@@ -133,11 +133,14 @@
   "Per command key, the other keys some engine's generator reads for that
   command (besides override-keys).  The :drop-index of an :alter-table is that
   step's own list of indexes, which the SQL Server generator drops; :alter-columns
-  is the PostgreSQL generator's; :modify-column is the one column the SQL Server
-  generator alters for each of :modify-columns."
+  is the PostgreSQL generator's.  :modify-column is left out: the SQL Server
+  generator builds it for its own recursion, one command per column of
+  :modify-columns, which never passes through check-commands!, so a migration
+  never writes it, and the singular spelling is the likeliest typo of
+  :modify-columns."
   {:create-table #{:columns :primary-key :constraints :add-constraints :table-options}
    :drop-table   #{}
-   :alter-table  #{:add-columns :drop-columns :modify-columns :modify-column :alter-columns
+   :alter-table  #{:add-columns :drop-columns :modify-columns :alter-columns
                    :add-constraints :drop-constraints :drop-index :primary-key :table-options
                    :character-set}
    :create-index #{:on :columns :unique}

@@ -926,12 +926,14 @@
   :drop-index
   [{index :drop-index table :on}]
   ;; The index is there when the catalog, read before the migration runs, shows it: a plain DROP
-  ;; INDEX, unless an earlier command of the migration already drops it or its table (read as-run,
-  ;; a drop that runs before this one): the catalog is then stale, and the drop is DROP INDEX IF
-  ;; EXISTS, which removes the index if a command between created it again and otherwise does
-  ;; nothing, where a plain DROP INDEX would fail with error 3701.  When only the migration's
-  ;; earlier commands hold it (plan-created-index?), the drop is DROP INDEX IF EXISTS too, a no-op
-  ;; where the plan reads an index that is not there.
+  ;; INDEX, unless an earlier command of the migration may already drop it or its table, read as the
+  ;; create-index and add-constraints guards read the plan (as-claimed: a key, or a drop clause
+  ;; anywhere in a statement of an override or a plain :update, behind a condition or inside a
+  ;; comment included).  The catalog may then be stale, and the drop is DROP INDEX IF EXISTS, which
+  ;; removes the index when it is there and otherwise does nothing, where a plain DROP INDEX would
+  ;; fail with error 3701 after a drop that ran; crediting a drop that did not run costs nothing
+  ;; here.  When only the migration's earlier commands hold it (plan-created-index?), the drop is
+  ;; DROP INDEX IF EXISTS too, a no-op where the plan reads an index that is not there.
   (cond
     (not *db*)
     (do (log/info " - Dropping index" (log/highlight (name index)))
@@ -939,8 +941,8 @@
 
     (index-exists? *db* (to-sql-name table) (to-sql-name index))
     (let [plan (if *plan* @*plan* [])]
-      (if (or (contains? (plan-dropped-indexes as-run plan) [(folded-name table) (folded-name index)])
-              (contains? (plan-dropped-tables as-run plan) (folded-name table)))
+      (if (or (contains? (plan-dropped-indexes as-claimed plan) [(folded-name table) (folded-name index)])
+              (contains? (plan-dropped-tables as-claimed plan) (folded-name table)))
         (do (log/info " - Dropping index" (log/highlight (name index)) "an earlier command in this migration dropped, if it exists")
             [(format "DROP INDEX IF EXISTS %s ON %s" (to-sql-name index) (to-sql-name table))])
         (do (log/info " - Dropping index" (log/highlight (name index)))
