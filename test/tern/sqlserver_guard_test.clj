@@ -1507,8 +1507,9 @@
 ;; ---------------------------------------------------------------------------
 ;; A plain :update, a command whose command key is :update, runs its statements as written (the
 ;; :update method hands them on, each string of a vector one statement), so the plan readers read
-;; it as they read an override: the refusal and the drop-index guard count a statement that is the
-;; drop alone (as-run), the other guards a drop anywhere in a statement (as-claimed).  A command
+;; it as they read an override: the refusal and the drop-index guard's plan branch count a statement
+;; that is the drop alone (as-run), the other guards and the drop-index guard's catalog branch a drop
+;; anywhere in a statement (as-claimed).  A command
 ;; with both an :update and an override runs the override alone and is read by it alone.
 
 (defn- after-update

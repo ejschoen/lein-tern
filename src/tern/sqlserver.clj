@@ -426,11 +426,13 @@
   only by drops its statements make, for each consumer on its safe side: the
   create-index guard reads as-claimed, where an index counted as dropped too
   often makes its CREATE fail when it runs, while one missed would skip the
-  create and lose the index without a word; the column-drop refusal and the
-  drop-index guard read as-run (plan-created-indexes), crediting only a
-  statement that is the drop alone, which has run when the commands after it
-  run, so the column drop meets no error 5074 and the DROP INDEX skipped had
-  nothing left to drop, while a drop they miss only refuses a column drop or
+  create and lose the index without a word, and so does the drop-index guard's
+  catalog branch, where a drop counted too often only turns a DROP INDEX into
+  DROP INDEX IF EXISTS; the column-drop refusal and the drop-index guard's plan
+  branch read as-run (plan-created-indexes), crediting only a statement that is
+  the drop alone, which has run when the commands after it run, so the column
+  drop meets no error 5074 and the DROP INDEX skipped had nothing left to drop,
+  while a drop they miss only refuses a column drop or
   leaves a DROP INDEX IF EXISTS that does nothing."
   [reading plan]
   (set (mapcat (fn [command]
@@ -561,11 +563,13 @@
   consumer on its safe side: the create-table, create-index, add-constraints and
   add-columns guards read as-claimed, where a table counted as dropped too often
   makes the create or add fail when it runs, while one missed would skip it and
-  lose the table, index, constraint or column without a word; the column-drop
-  refusal and the drop-index guard read as-run, crediting only a statement that
-  is the drop alone, which has run when the commands after it run, while a drop
-  they miss only refuses a column drop or leaves a DROP INDEX IF EXISTS that
-  does nothing."
+  lose the table, index, constraint or column without a word, and so does the
+  drop-index guard's catalog branch, where a table counted as dropped too often
+  only turns a DROP INDEX into DROP INDEX IF EXISTS; the column-drop refusal and
+  the drop-index guard's plan branch read as-run, crediting only a statement
+  that is the drop alone, which has run when the commands after it run, while a
+  drop they miss only refuses a column drop or leaves a DROP INDEX IF EXISTS
+  that does nothing."
   [reading plan]
   (set (mapcat (fn [command]
                  (reading command
