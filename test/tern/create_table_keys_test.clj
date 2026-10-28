@@ -31,8 +31,8 @@
 (expect ["CREATE TABLE t (CONSTRAINT fk_t_b FOREIGN KEY (b_id) REFERENCES b(id) ON DELETE CASCADE, CONSTRAINT fk_t_a FOREIGN KEY (a_id) REFERENCES a(id), PRIMARY KEY (id), id INT, a_id INT, b_id INT)"]
         (quietly sqlserver/generate-sql both))
 
-;; MySQL.
-(expect ["CREATE TABLE t (id INT, a_id INT, b_id INT, PRIMARY KEY (`id`), CONSTRAINT `fk_t_a` FOREIGN KEY (a_id) REFERENCES a(id), CONSTRAINT `fk_t_b` FOREIGN KEY (b_id) REFERENCES b(id) ON DELETE CASCADE)"]
+;; MySQL, which backticks every name, those inside the keys' specs included.
+(expect ["CREATE TABLE `t` (`id` INT, `a_id` INT, `b_id` INT, PRIMARY KEY (`id`), CONSTRAINT `fk_t_a` FOREIGN KEY (`a_id`) REFERENCES `a`(`id`), CONSTRAINT `fk_t_b` FOREIGN KEY (`b_id`) REFERENCES `b`(`id`) ON DELETE CASCADE)"]
         (quietly mysql/generate-sql both))
 
 ;; H2 v2, which upper-cases the names.
@@ -49,7 +49,7 @@
 
 ;; A step with neither key writes no key on any engine, and PostgreSQL writes none even with both.
 (expect {:sqlserver  ["CREATE TABLE t (PRIMARY KEY (id), id INT, a_id INT, b_id INT)"]
-         :mysql      ["CREATE TABLE t (id INT, a_id INT, b_id INT, PRIMARY KEY (`id`))"]
+         :mysql      ["CREATE TABLE `t` (`id` INT, `a_id` INT, `b_id` INT, PRIMARY KEY (`id`))"]
          :h2v2       ["CREATE TABLE t (PRIMARY KEY (id), ID INT, A_ID INT, B_ID INT)"]
          :h2v1       ["CREATE TABLE t (PRIMARY KEY (id), id INT, a_id INT, b_id INT)"]
          :sqlite     ["CREATE TABLE t (id INT, a_id INT, b_id INT, PRIMARY KEY (id))"]
@@ -73,8 +73,8 @@
         (vec (quietly sqlserver/generate-sql (assoc both :table-options [{:name "ROW_FORMAT" :value "Compressed"}]))))
 
 ;; So does MySQL.
-(expect ["CREATE TABLE t (__placeholder int)"
-         "ALTER TABLE `t` ROW_FORMAT=Compressed, ADD COLUMN `id` INT, ADD COLUMN `a_id` INT, ADD COLUMN `b_id` INT, ADD CONSTRAINT `fk_t_a` FOREIGN KEY (a_id) REFERENCES a(id), ADD CONSTRAINT `fk_t_b` FOREIGN KEY (b_id) REFERENCES b(id) ON DELETE CASCADE"
+(expect ["CREATE TABLE `t` (`__placeholder` int)"
+         "ALTER TABLE `t` ROW_FORMAT=Compressed, ADD COLUMN `id` INT, ADD COLUMN `a_id` INT, ADD COLUMN `b_id` INT, ADD CONSTRAINT `fk_t_a` FOREIGN KEY (`a_id`) REFERENCES `a`(`id`), ADD CONSTRAINT `fk_t_b` FOREIGN KEY (`b_id`) REFERENCES `b`(`id`) ON DELETE CASCADE"
          "ALTER TABLE `t` ADD PRIMARY KEY (`id`)"
          "ALTER TABLE `t` DROP COLUMN `__placeholder`"]
         (vec (quietly mysql/generate-sql (assoc both :table-options [{:name "ROW_FORMAT" :value "Compressed"}]))))

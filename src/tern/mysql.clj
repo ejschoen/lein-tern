@@ -57,6 +57,52 @@
   [x]
   (if (or (nil? x) (coll? x)) x [x]))
 
+(defn- quote-identifier
+  "One name of a foreign-key spec in backticks; a name already in backticks is
+  returned as written."
+  [n]
+  (if (re-matches #"`[^`]+`" n) n (str "`" n "`")))
+
+(def ^:private spec-name
+  "A name inside a foreign-key spec: a name in backticks, or a run of characters
+  that are not blanks, commas, parentheses, dots or backticks."
+  "(?:`[^`]+`|[^\\s,().`]+)")
+
+(defn- quote-name-list
+  "The comma-separated names between the parentheses of a foreign-key spec, each
+  backticked, the blanks around them kept; nil when an item is not one name."
+  [text]
+  (let [items (s/split text #"," -1)
+        quoted (for [item items]
+                 (when-let [[_ before n after] (re-matches (re-pattern (str "(\\s*)(" spec-name ")(\\s*)")) item)]
+                   (str before (quote-identifier n) after)))]
+    (when (every? some? quoted)
+      (s/join "," quoted))))
+
+(defn- quote-table-reference
+  "A referenced table, `db.table` quoted per part; nil when a part is not one name."
+  [text]
+  (let [parts (s/split text #"\." -1)]
+    (when (every? #(re-matches (re-pattern spec-name) %) parts)
+      (s/join "." (map quote-identifier parts)))))
+
+(defn quote-foreign-key-spec
+  "A foreign-key spec `(<cols>) REFERENCES <table>(<cols>) <rest>` with every
+  column name and the referenced table backticked where they are not already (a
+  dotted `db.table` per part), its blanks, case and `<rest>` (such as
+  `ON DELETE CASCADE`) kept as written.  A spec of another shape is returned as
+  written."
+  [spec]
+  (if-let [[_ open cols middle table before-ref ref-cols rest]
+           (re-matches #"(?s)(\s*\()([^()]*)(\)\s*(?i:REFERENCES)\s+)([^\s()]+)(\s*\()([^()]*)(\).*)" spec)]
+    (let [cols' (quote-name-list cols)
+          table' (quote-table-reference table)
+          ref-cols' (quote-name-list ref-cols)]
+      (if (and cols' table' ref-cols')
+        (str open cols' middle table' before-ref ref-cols' rest)
+        spec))
+    spec))
+
 (defn generate-constraints
   [command]
   (let [constraints (inline-constraints command)
@@ -66,8 +112,20 @@
             (do
               (format "CONSTRAINT %s FOREIGN KEY %s"
                       (to-sql-name constraint)
-                      (s/join " " specs)))))]
+                      (quote-foreign-key-spec (s/join " " specs))))))]
     (when fks (map (fn [fk] [fk]) fks))))
+
+(defn- create-table-ddl
+  "CREATE TABLE <table> (<column specs>, <clauses>): the table and each column
+  name backticked, each column's specs joined by a space as written, and the
+  clauses (the primary key, the constraints), each already a whole clause, as
+  they are."
+  [table columns clauses]
+  (format "CREATE TABLE %s (%s)"
+          (to-sql-name table)
+          (s/join ", " (concat (for [[column & specs] columns]
+                                 (s/join " " (cons (to-sql-name column) (map name specs))))
+                               clauses))))
 
 
 (defn generate-options
@@ -104,17 +162,13 @@
                 [(format "ALTER TABLE %s ADD %s" (to-sql-name table) pk)]
                 (generate-sql {:alter-table table
                                :drop-columns [:__placeholder]})))
-        [(if pk
-           (apply jdbc/create-table-ddl table (apply conj columns [pk] constraints))
-           (if constraints
-             (apply jdbc/create-table-ddl table (apply conj columns constraints))
-             (apply jdbc/create-table-ddl table columns)))]))))
+        [(create-table-ddl table columns (concat (when pk [pk]) (map first constraints)))]))))
 
 (defmethod generate-sql
   :drop-table
   [{table :drop-table}]
   (log/info " - Dropping table" (log/highlight (name table)))
-  [(jdbc/drop-table-ddl table)])
+  [(format "DROP TABLE %s" (to-sql-name table))])
 
 (defmethod generate-sql
   :alter-table
@@ -180,9 +234,9 @@
                                 @*plan*))
                     (do
                       (log/info "    * Adding constraint " (log/highlight (if constraint constraint "unnamed")))
-                      (format "ADD CONSTRAINT %s FOREIGN KEY %s" 
+                      (format "ADD CONSTRAINT %s FOREIGN KEY %s"
                               (to-sql-name constraint)
-                              (s/join  " " specs)))
+                              (quote-foreign-key-spec (s/join " " specs))))
                     (log/info "    * Skipping adding constraint " (log/highlight (if constraint constraint "unnamed"))
                               " because it already exists"))))
         old-constraints

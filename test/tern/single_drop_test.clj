@@ -46,7 +46,7 @@
 
 ;; MySQL's plan reader: a column and a constraint the catalog shows are added again when an earlier
 ;; command of the migration dropped them, each named by a single keyword.
-(expect ["ALTER TABLE `t` ADD COLUMN `c` INT, ADD CONSTRAINT `fk_x` FOREIGN KEY (c) REFERENCES u(id)"]
+(expect ["ALTER TABLE `t` ADD COLUMN `c` INT, ADD CONSTRAINT `fk_x` FOREIGN KEY (`c`) REFERENCES `u`(`id`)"]
         (with-redefs [mysql/column-exists?      (fn [d t c] (= [d t c] [db "`t`" "`c`"]))
                       mysql/foreign-key-exists? (fn [d fk] (= [d fk] [db "`fk_x`"]))]
           (binding [tern.log/*info* false
